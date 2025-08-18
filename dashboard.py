@@ -1,18 +1,25 @@
 import os
-import json
 from flask import Flask, render_template, request, redirect, url_for
 import firebase_admin
 from firebase_admin import credentials, firestore
-from dotenv import load_dotenv
 
-load_dotenv()
+# Try to load environment variables from a .env file for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # If python-dotenv is not installed (e.g., on Vercel), do nothing.
+    # The environment variables will be read directly from the system.
+    pass
 
 app = Flask(__name__)
 
 # --- Firebase Initialization with Environment Variables ---
 try:
+    # Read private key from environment variable, replacing escaped newlines
     private_key_content = os.getenv('private_key', '').replace('\\n', '\n')
 
+    # Construct the credentials dictionary from environment variables
     cred_dict = {
         "type": os.getenv('type', ''),
         "project_id": os.getenv('project_id', ''),
@@ -39,6 +46,7 @@ except Exception as e:
 
 @app.route('/')
 def index():
+    """Display the list of games and their status."""
     games = db.collection('games').stream()
     game_list = [{
         'id': game.id,
@@ -48,6 +56,7 @@ def index():
 
 @app.route('/update_status/<game_id>', methods=['POST'])
 def update_status(game_id):
+    """Update the status of a game."""
     new_status = request.form.get('status')
     if new_status in ['ready', 'dev']:
         db.collection('games').document(game_id).update({'status': new_status})
