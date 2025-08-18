@@ -1,20 +1,12 @@
 import os
+import json
 from flask import Flask, render_template, request, redirect, url_for
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Try to load environment variables from a .env file for local development
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    # If python-dotenv is not installed (e.g., on Vercel), do nothing.
-    # The environment variables will be read directly from the system.
-    pass
-
 app = Flask(__name__)
 
-# --- Firebase Initialization with Environment Variables ---
+# --- Firebase Initialization with Vercel's Environment Variables ---
 try:
     # Read private key from environment variable, replacing escaped newlines
     private_key_content = os.getenv('private_key', '').replace('\\n', '\n')
