@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Mano Launcher Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #2c3e50;
+            color: white;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+            background-color: #34495e;
+            border-radius: 10px;
+        }
+
+        h1 {
+            text-align: center;
+        }
+
+        .game-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            border-bottom: 1px solid #4a6c8e;
+        }
+
+        .game-item:last-child {
+            border-bottom: none;
+        }
+
+        .status-form {
+            display: flex;
+            gap: 10px;
+        }
+
+        .status-form button {
+            padding: 5px 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            border: none;
+        }
+
+        .status-form button[value="ready"] {
+            background-color: #27ae60;
+            color: white;
+        }
+
+        .status-form button[value="dev"] {
+            background-color: #e74c3c;
+            color: white;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Mano Launcher Dashboard</h1>
+        {% for game in games %}
+        <div class="game-item">
+            <div>
+                <strong>{{ game.id }}</strong> (Version: {{ game.info.version }})
+                <br>
+                Status: {{ game.info.status }}
+            </div>
+            <div class="status-form">
+                <form method="post" action="{{ url_for('update_status', game_id=game.id) }}">
+                    <input type="hidden" name="status" value="ready">
+                    <button type="submit">Set Ready</button>
+                </form>
+                <form method="post" action="{{ url_for('update_status', game_id=game.id) }}">
+                    <input type="hidden" name="status" value="dev">
+                    <button type="submit">Set Dev</button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</body>
+
+</html>
