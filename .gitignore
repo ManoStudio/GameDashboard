@@ -1,3 +1,5 @@
 # Git ignore file
 serviceAccountKey.json
 .env
+__pycache__/
+*.log
