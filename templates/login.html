@@ -106,12 +106,64 @@
             cursor: pointer;
         }
 
+        button[disabled] {
+            cursor: wait;
+            opacity: 0.72;
+        }
+
         .alert {
             border: 1px solid #efb2c1;
             background: #fff0f4;
             color: var(--rose);
             border-radius: 8px;
             padding: 12px;
+        }
+
+        .soft-load {
+            position: fixed;
+            right: 20px;
+            bottom: 20px;
+            z-index: 50;
+            width: min(360px, calc(100vw - 36px));
+            display: none;
+            grid-template-columns: 34px minmax(0, 1fr);
+            gap: 12px;
+            align-items: center;
+            background: rgba(31, 42, 39, 0.96);
+            color: #f8fff9;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            padding: 14px;
+        }
+
+        .soft-load.active {
+            display: grid;
+        }
+
+        .soft-load strong {
+            display: block;
+            line-height: 1.2;
+        }
+
+        .soft-load span {
+            color: #b9cbc2;
+            font-size: 13px;
+        }
+
+        .spinner {
+            width: 28px;
+            height: 28px;
+            border: 3px solid rgba(255, 255, 255, 0.24);
+            border-top-color: var(--lime);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
         }
     </style>
 </head>
@@ -134,7 +186,7 @@
         <div class="alert">Firebase is not configured, so only demo/admin env users can sign in.</div>
         {% endif %}
 
-        <form class="form-grid" method="post">
+        <form class="form-grid" method="post" data-loading-steps="Checking credentials|Creating session|Opening dashboard">
             <label class="field">
                 <span class="label">Email</span>
                 <input name="email" type="email" autocomplete="email" required autofocus>
@@ -146,6 +198,48 @@
             <button type="submit">Login</button>
         </form>
     </main>
+
+    <div class="soft-load" id="softLoad" role="status" aria-live="polite" aria-hidden="true">
+        <div class="spinner" aria-hidden="true"></div>
+        <div>
+            <strong id="softLoadTitle">Working</strong>
+            <span id="softLoadStep">Please wait</span>
+        </div>
+    </div>
+
+    <script>
+        const softLoad = document.getElementById("softLoad");
+        const softLoadTitle = document.getElementById("softLoadTitle");
+        const softLoadStep = document.getElementById("softLoadStep");
+        let softLoadTimer = null;
+
+        function showSoftLoad(steps, source) {
+            const safeSteps = steps.filter(Boolean);
+            clearInterval(softLoadTimer);
+            let index = 0;
+            softLoadTitle.textContent = safeSteps[0] || "Working";
+            softLoadStep.textContent = safeSteps[1] || "Waiting for the server to finish";
+            softLoad.classList.add("active");
+            softLoad.setAttribute("aria-hidden", "false");
+
+            source.querySelectorAll("button").forEach((button) => {
+                button.disabled = true;
+                button.textContent = "Working...";
+            });
+
+            softLoadTimer = setInterval(() => {
+                index = (index + 1) % safeSteps.length;
+                softLoadTitle.textContent = safeSteps[index];
+                softLoadStep.textContent = "Waiting for the request to complete";
+            }, 1400);
+        }
+
+        document.querySelectorAll("form[data-loading-steps]").forEach((form) => {
+            form.addEventListener("submit", () => {
+                showSoftLoad(form.dataset.loadingSteps.split("|"), form);
+            });
+        });
+    </script>
 </body>
 
 </html>

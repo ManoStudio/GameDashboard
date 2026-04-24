@@ -202,6 +202,12 @@
             color: #fff;
         }
 
+        .button[disabled],
+        .icon-button[disabled] {
+            cursor: wait;
+            opacity: 0.72;
+        }
+
         .icon-button {
             width: 40px;
             padding: 0;
@@ -435,6 +441,57 @@
             padding: 12px;
         }
 
+        .soft-load {
+            position: fixed;
+            right: 20px;
+            bottom: 20px;
+            z-index: 50;
+            width: min(360px, calc(100vw - 36px));
+            display: none;
+            grid-template-columns: 34px minmax(0, 1fr);
+            gap: 12px;
+            align-items: center;
+            background: rgba(31, 42, 39, 0.96);
+            color: #f8fff9;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            padding: 14px;
+        }
+
+        .soft-load.active {
+            display: grid;
+        }
+
+        .soft-load strong {
+            display: block;
+            line-height: 1.2;
+        }
+
+        .soft-load span {
+            color: #b9cbc2;
+            font-size: 13px;
+        }
+
+        .spinner {
+            width: 28px;
+            height: 28px;
+            border: 3px solid rgba(255, 255, 255, 0.24);
+            border-top-color: var(--lime);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        .is-loading {
+            pointer-events: none;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
         .empty {
             min-height: 240px;
             display: grid;
@@ -505,7 +562,8 @@
                     <strong>{{ user.email }}</strong>
                     <div class="tiny">role: {{ user.role }}</div>
                 </div>
-                <form method="post" action="{{ url_for('logout') }}">
+                <form method="post" action="{{ url_for('logout') }}"
+                    data-loading-steps="Signing out|Clearing session|Returning to login">
                     <button class="button secondary" type="submit">Logout</button>
                 </form>
             </div>
@@ -515,6 +573,7 @@
                 <nav class="project-list" aria-label="Projects">
                     {% for project in projects %}
                     <a class="project-link {% if selected_project and selected_project.id == project.id %}active{% endif %}"
+                        data-loading-steps="Opening project|Loading builds|Preparing dashboard"
                         href="{{ url_for('index', project=project.id) }}">
                         <div class="project-icon">{{ project.icon[:2]|upper }}</div>
                         <div class="truncate">
@@ -527,7 +586,8 @@
             </div>
 
             {% if user.role == "admin" %}
-            <form class="form-grid" method="post" action="{{ url_for('create_project') }}">
+            <form class="form-grid" method="post" action="{{ url_for('create_project') }}"
+                data-loading-steps="Creating project|Saving project data|Refreshing dashboard">
                 <h3>Create Project</h3>
                 <label class="field">
                     <span class="label">Project name</span>
@@ -568,9 +628,11 @@
                 </div>
                 <div class="actions">
                     {% if latest_build %}
-                    <a class="button secondary" href="{{ url_for('build_manifest', build_id=latest_build.id) }}">Manifest</a>
+                    <a class="button secondary" href="{{ url_for('build_manifest', build_id=latest_build.id) }}"
+                        data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>
                     {% endif %}
-                    <a class="button secondary" href="{{ url_for('api_project_builds', project_id=selected_project.id) }}">API</a>
+                    <a class="button secondary" href="{{ url_for('api_project_builds', project_id=selected_project.id) }}"
+                        data-loading-steps="Opening API response|Loading project builds">API</a>
                 </div>
             </section>
 
@@ -585,7 +647,8 @@
                     </div>
 
                     {% if user.role == "admin" %}
-                    <form class="form-grid" method="post" action="{{ url_for('update_project', project_id=selected_project.id) }}">
+                    <form class="form-grid" method="post" action="{{ url_for('update_project', project_id=selected_project.id) }}"
+                        data-loading-steps="Saving project|Updating Firestore|Refreshing dashboard">
                         <label class="field">
                             <span class="label">Project name</span>
                             <input name="name" value="{{ selected_project.name }}" required>
@@ -610,7 +673,8 @@
                     </form>
 
                     <form method="post" action="{{ url_for('remove_project', project_id=selected_project.id) }}"
-                        onsubmit="return confirm('Delete this project and all builds?');">
+                        data-confirm="Delete this project and all builds?"
+                        data-loading-steps="Deleting project builds|Removing project|Refreshing dashboard">
                         <button class="button danger" type="submit">Delete Project</button>
                     </form>
                     {% endif %}
@@ -635,6 +699,7 @@
                 <div class="panel">
                     <h3>Build Upload</h3>
                     <form class="form-grid" method="post" enctype="multipart/form-data"
+                        data-loading-steps="Uploading build|Reading files|Generating manifest|Saving build|Refreshing history"
                         action="{{ url_for('upload_build', project_id=selected_project.id) }}">
                         <label class="dropzone">
                             <input type="file" name="build" multiple required>
@@ -684,7 +749,8 @@
             {% if user.role == "admin" %}
             <section class="panel">
                 <h3>User Access</h3>
-                <form class="form-grid" method="post" action="{{ url_for('upsert_user') }}">
+                <form class="form-grid" method="post" action="{{ url_for('upsert_user') }}"
+                    data-loading-steps="Saving user|Updating role|Refreshing access list">
                     <div class="form-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr));">
                         <label class="field">
                             <span class="label">Email</span>
@@ -768,7 +834,8 @@
 
                         <div class="split-actions">
                             {% if user.role in ["admin", "dev", "QA"] %}
-                            <form class="inline-form" method="post" action="{{ url_for('update_build_channel', build_id=build.id) }}">
+                            <form class="inline-form" method="post" action="{{ url_for('update_build_channel', build_id=build.id) }}"
+                                data-loading-steps="Assigning channel|Updating build status|Refreshing history">
                                 <select name="channel">
                                     {% for channel in channels %}
                                     {% if user.role == "admin" or (user.role == "dev" and channel != "live") or (user.role == "QA" and channel == "qa") %}
@@ -780,9 +847,11 @@
                             </form>
                             {% endif %}
                             <div class="actions">
-                                <a class="button secondary" href="{{ url_for('build_manifest', build_id=build.id) }}">Manifest</a>
+                                <a class="button secondary" href="{{ url_for('build_manifest', build_id=build.id) }}"
+                                    data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>
                                 {% if user.role == "admin" %}
-                                <form method="post" action="{{ url_for('rollback_build', build_id=build.id) }}">
+                                <form method="post" action="{{ url_for('rollback_build', build_id=build.id) }}"
+                                    data-loading-steps="Starting rollback|Promoting build to live|Refreshing history">
                                     <button class="button secondary" type="submit">Rollback</button>
                                 </form>
                                 {% endif %}
@@ -805,6 +874,68 @@
             {% endif %}
         </main>
     </div>
+
+    <div class="soft-load" id="softLoad" role="status" aria-live="polite" aria-hidden="true">
+        <div class="spinner" aria-hidden="true"></div>
+        <div>
+            <strong id="softLoadTitle">Working</strong>
+            <span id="softLoadStep">Please wait</span>
+        </div>
+    </div>
+
+    <script>
+        const softLoad = document.getElementById("softLoad");
+        const softLoadTitle = document.getElementById("softLoadTitle");
+        const softLoadStep = document.getElementById("softLoadStep");
+        let softLoadTimer = null;
+
+        function showSoftLoad(steps, source) {
+            const safeSteps = steps.filter(Boolean);
+            if (!safeSteps.length) {
+                safeSteps.push("Working");
+            }
+
+            clearInterval(softLoadTimer);
+            let index = 0;
+            softLoadTitle.textContent = safeSteps[0];
+            softLoadStep.textContent = safeSteps.length > 1 ? safeSteps[1] : "Waiting for the server to finish";
+            softLoad.classList.add("active");
+            softLoad.setAttribute("aria-hidden", "false");
+            document.body.classList.add("is-loading");
+
+            if (source) {
+                source.classList.add("is-loading");
+                source.querySelectorAll("button, input[type='submit']").forEach((button) => {
+                    button.disabled = true;
+                    button.dataset.originalText = button.textContent;
+                    button.textContent = "Working...";
+                });
+            }
+
+            softLoadTimer = setInterval(() => {
+                index = (index + 1) % safeSteps.length;
+                softLoadTitle.textContent = safeSteps[index];
+                softLoadStep.textContent = "Waiting for the request to complete";
+            }, 1400);
+        }
+
+        document.querySelectorAll("form[data-loading-steps]").forEach((form) => {
+            form.addEventListener("submit", (event) => {
+                const message = form.dataset.confirm;
+                if (message && !confirm(message)) {
+                    event.preventDefault();
+                    return;
+                }
+                showSoftLoad(form.dataset.loadingSteps.split("|"), form);
+            });
+        });
+
+        document.querySelectorAll("a[data-loading-steps]").forEach((link) => {
+            link.addEventListener("click", () => {
+                showSoftLoad(link.dataset.loadingSteps.split("|"), link);
+            });
+        });
+    </script>
 </body>
 
 </html>
