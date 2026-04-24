@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 import firebase_admin
+from google.api_core import exceptions as google_exceptions
 from firebase_admin import credentials, firestore
 
 # Try to load environment variables from a .env file for local development.
@@ -140,13 +141,16 @@ def list_builds(project_id):
     if db is None:
         builds = demo_builds.get(project_id, [])
         return sorted(builds, key=lambda build: build.get("created_at", ""), reverse=True)
-    builds = (
-        db.collection("builds")
-        .where("project_id", "==", project_id)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .stream()
-    )
-    return [document_with_id(build) for build in builds]
+    query = db.collection("builds").where("project_id", "==", project_id)
+    try:
+        builds = query.order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+        return [document_with_id(build) for build in builds]
+    except google_exceptions.FailedPrecondition as exc:
+        if "requires an index" not in str(exc):
+            raise
+
+        builds = [document_with_id(build) for build in query.stream()]
+        return sorted(builds, key=lambda build: build.get("created_at", ""), reverse=True)
 
 
 def get_build(build_id):
