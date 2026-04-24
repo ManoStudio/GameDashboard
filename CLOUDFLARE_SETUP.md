@@ -12,11 +12,26 @@ It uses:
 ## 1. Create Cloudflare resources
 
 ```bash
-npx wrangler d1 create game-dashboard-db
-npx wrangler r2 bucket create game-dashboard-builds
+npm run db:create
+npm run r2:create
 ```
 
 Copy the returned D1 `database_id` into `wrangler.toml`.
+
+Example output:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "game-dashboard-db"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+The deploy will fail with this error until the placeholder is replaced:
+
+```text
+binding DB of type d1 must have a valid `database_id` specified
+```
 
 ## 2. Create R2 API token
 
@@ -35,6 +50,18 @@ npx wrangler secret put R2_SECRET_ACCESS_KEY
 ```
 
 Set `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and optional `R2_PUBLIC_URL` in `wrangler.toml`.
+
+Your deploy log already shows the account id in the failed API path:
+
+```text
+/accounts/4956abaf4d499cde396a8c7ebf6061c6/...
+```
+
+So `R2_ACCOUNT_ID` should be:
+
+```toml
+R2_ACCOUNT_ID = "4956abaf4d499cde396a8c7ebf6061c6"
+```
 
 ## 4. Apply D1 schema
 
@@ -58,6 +85,17 @@ Replace the placeholder origin with your real Worker domain.
 
 ```bash
 npm install
+npm run db:migrate
 npm run dev
 npm run deploy
 ```
+
+## Cloudflare Pages build settings
+
+Use this deploy command:
+
+```bash
+npx wrangler deploy
+```
+
+This project no longer needs Python dependencies for Cloudflare. If Pages still runs `pip install -r requirements.txt`, remove the old Python deployment files from the Cloudflare-connected branch or set the project as a Workers deployment that uses `wrangler.toml`.

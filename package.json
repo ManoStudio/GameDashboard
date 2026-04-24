@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "db:create": "wrangler d1 create game-dashboard-db",
+    "r2:create": "wrangler r2 bucket create game-dashboard-builds",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrate": "wrangler d1 migrations apply game-dashboard-db --local && wrangler d1 migrations apply game-dashboard-db --remote"

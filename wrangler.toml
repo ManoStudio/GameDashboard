@@ -5,7 +5,8 @@ compatibility_date = "2026-04-24"
 [[d1_databases]]
 binding = "DB"
 database_name = "game-dashboard-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+# Run `npx wrangler d1 create game-dashboard-db`, then paste the returned database_id here.
+database_id = "9759c99c-47f6-4c70-b0f7-6d85ec9b5b2b"
 
 [[r2_buckets]]
 binding = "BUILDS_BUCKET"
@@ -13,5 +14,6 @@ bucket_name = "game-dashboard-builds"
 
 [vars]
 R2_BUCKET_NAME = "game-dashboard-builds"
-R2_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+# Cloudflare dashboard -> Workers & Pages -> Overview, or the account id in your deploy log URL.
+R2_ACCOUNT_ID = "4956abaf4d499cde396a8c7ebf6061c6"
 R2_PUBLIC_URL = ""
