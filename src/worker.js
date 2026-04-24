@@ -117,6 +117,10 @@ async function dispatch(request, env, url, user) {
   if (channel && (method === "POST" || method === "PATCH")) return requireRole(user, "admin", "dev", "QA", true) || updateBuildChannel(request, env, user, channel[1]);
   const rollback = path.match(/^\/builds\/([^/]+)\/rollback$/);
   if (rollback && method === "POST") return requireRole(user, "admin") || rollbackBuild(env, rollback[1]);
+  const buildDelete = path.match(/^\/builds\/([^/]+)\/delete$/);
+  if (buildDelete && method === "POST") return requireRole(user, "admin", "dev") || deleteBuild(env, buildDelete[1]);
+  const apiBuildDelete = path.match(/^\/api\/builds\/([^/]+)$/);
+  if (apiBuildDelete && method === "DELETE") return requireRole(user, "admin", "dev", true) || deleteBuildJson(env, apiBuildDelete[1]);
 
   return null;
 }
@@ -421,6 +425,26 @@ async function rollbackBuild(env, buildId) {
   const build = await env.DB.prepare("SELECT project_id FROM builds WHERE id = ?").bind(buildId).first();
   await env.DB.prepare("UPDATE builds SET channel = 'live', tag = 'rollback', updated_at = ? WHERE id = ?").bind(nowIso(), buildId).run();
   return redirect(`/?project=${build?.project_id || ""}`);
+}
+
+async function deleteBuild(env, buildId) {
+  const result = await deleteBuildData(env, buildId);
+  return redirect(`/?project=${result.project_id || ""}`);
+}
+
+async function deleteBuildJson(env, buildId) {
+  const result = await deleteBuildData(env, buildId);
+  return json({ id: buildId, project_id: result.project_id, deleted_files: result.deleted_files });
+}
+
+async function deleteBuildData(env, buildId) {
+  const build = await env.DB.prepare("SELECT id, project_id FROM builds WHERE id = ?").bind(buildId).first();
+  if (!build) return { project_id: "", deleted_files: 0 };
+  const prefix = `builds/${build.project_id}/${build.id}/`;
+  const listed = await env.BUILDS_BUCKET.list({ prefix });
+  await Promise.all((listed.objects || []).map(object => env.BUILDS_BUCKET.delete(object.key)));
+  await env.DB.prepare("DELETE FROM builds WHERE id = ?").bind(build.id).run();
+  return { project_id: build.project_id, deleted_files: (listed.objects || []).length };
 }
 
 async function buildManifest(request, env, buildId, user = null) {
@@ -765,7 +789,7 @@ function buildHistory(user, project, builds) {
 
 function buildCard(user, build) {
   const channels = CHANNELS.filter(channel => canAssign(user.role, channel));
-  return `<article class="card"><div class="build-head"><div><h3>Version ${escapeHtml(build.version)}</h3><p>${escapeHtml(build.created_at)}</p></div><div class="badges"><span class="badge ${escapeHtml(build.channel)}">${escapeHtml(build.channel)}</span>${build.tag ? `<span class="badge tag">${escapeHtml(build.tag)}</span>` : ""}<span class="badge">${escapeHtml(build.status)}</span></div></div><div class="build-meta"><div class="stat"><strong>${build.file_count}</strong><span>files</span></div><div class="stat"><strong>${(build.total_size / 1048576).toFixed(2)}</strong><span>MB</span></div><div class="stat"><strong>${escapeHtml(build.channel)}</strong><span>channel</span></div><div class="stat"><strong>${escapeHtml(build.tag || "-")}</strong><span>tag</span></div></div><p>${escapeHtml(build.changelog || "")}</p><div class="code">${escapeHtml(build.storage_path)} | ${escapeHtml(build.manifest_path)}</div><div class="split-actions">${channels.length ? `<form class="inline-form" method="post" action="/builds/${build.id}/channel" data-loading-steps="Assigning channel|Updating build status|Refreshing history"><select name="channel">${channels.map(c => `<option ${build.channel === c ? "selected" : ""}>${c}</option>`).join("")}</select><button class="icon-button">&rarr;</button></form>` : ""}<div class="actions"><a class="button secondary" href="/builds/${build.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>${user.role === "admin" ? `<form method="post" action="/builds/${build.id}/rollback" data-loading-steps="Starting rollback|Promoting build to live|Refreshing history"><button class="button secondary">Rollback</button></form>` : ""}</div></div></article>`;
+  return `<article class="card"><div class="build-head"><div><h3>Version ${escapeHtml(build.version)}</h3><p>${escapeHtml(build.created_at)}</p></div><div class="badges"><span class="badge ${escapeHtml(build.channel)}">${escapeHtml(build.channel)}</span>${build.tag ? `<span class="badge tag">${escapeHtml(build.tag)}</span>` : ""}<span class="badge">${escapeHtml(build.status)}</span></div></div><div class="build-meta"><div class="stat"><strong>${build.file_count}</strong><span>files</span></div><div class="stat"><strong>${(build.total_size / 1048576).toFixed(2)}</strong><span>MB</span></div><div class="stat"><strong>${escapeHtml(build.channel)}</strong><span>channel</span></div><div class="stat"><strong>${escapeHtml(build.tag || "-")}</strong><span>tag</span></div></div><p>${escapeHtml(build.changelog || "")}</p><div class="code">${escapeHtml(build.storage_path)} | ${escapeHtml(build.manifest_path)}</div><div class="split-actions">${channels.length ? `<form class="inline-form" method="post" action="/builds/${build.id}/channel" data-loading-steps="Assigning channel|Updating build status|Refreshing history"><select name="channel">${channels.map(c => `<option ${build.channel === c ? "selected" : ""}>${c}</option>`).join("")}</select><button class="icon-button">&rarr;</button></form>` : ""}<div class="actions"><a class="button secondary" href="/builds/${build.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>${user.role === "admin" ? `<form method="post" action="/builds/${build.id}/rollback" data-loading-steps="Starting rollback|Promoting build to live|Refreshing history"><button class="button secondary">Rollback</button></form>` : ""}${["admin", "dev"].includes(user.role) ? `<form method="post" action="/builds/${build.id}/delete" data-confirm="Delete build version ${escapeHtml(build.version)}?" data-loading-steps="Deleting build files|Removing build metadata|Refreshing history"><button class="button danger">Delete Build</button></form>` : ""}</div></div></article>`;
 }
 
 function emptyView() {
