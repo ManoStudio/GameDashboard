@@ -19,23 +19,21 @@ export default {
 };
 
 async function ensureSchema(env) {
-  await env.DB.exec(`
-    CREATE TABLE IF NOT EXISTS users (
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
       role TEXT NOT NULL,
       password_hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
+    )`,
+    `CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY,
       email TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS projects (
+    )`,
+    `CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       icon TEXT NOT NULL,
@@ -43,9 +41,8 @@ async function ensureSchema(env) {
       role TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS builds (
+    )`,
+    `CREATE TABLE IF NOT EXISTS builds (
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       version TEXT NOT NULL,
@@ -60,12 +57,15 @@ async function ensureSchema(env) {
       manifest_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
+    )`,
+    "CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_builds_project_created ON builds(project_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email)",
+  ];
 
-    CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_builds_project_created ON builds(project_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email);
-  `);
+  for (const statement of statements) {
+    await env.DB.prepare(statement).run();
+  }
 }
 
 async function dispatch(request, env, url, user) {
