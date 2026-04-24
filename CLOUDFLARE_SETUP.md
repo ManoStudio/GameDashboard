@@ -41,12 +41,24 @@ Use permissions that can read/write objects for the `game-dashboard-builds` buck
 
 ## 3. Configure Worker secrets
 
+Run these commands from the repository root, the same folder that contains `wrangler.toml`.
+
 ```bash
 npx wrangler secret put ADMIN_EMAIL
 npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put DASHBOARD_API_TOKEN
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
+```
+
+If Wrangler says the Worker name is missing, it is not reading `wrangler.toml`. Use:
+
+```bash
+npx wrangler secret put ADMIN_EMAIL --config wrangler.toml
+npx wrangler secret put ADMIN_PASSWORD --config wrangler.toml
+npx wrangler secret put DASHBOARD_API_TOKEN --config wrangler.toml
+npx wrangler secret put R2_ACCESS_KEY_ID --config wrangler.toml
+npx wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.toml
 ```
 
 Set `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and optional `R2_PUBLIC_URL` in `wrangler.toml`.
