@@ -92,9 +92,9 @@ async function dispatch(request, env, url, user) {
   const userDelete = path.match(/^\/users\/([^/]+)\/delete$/);
   if (userDelete && method === "POST") return requireRole(user, "admin") || deleteUser(request, env, user, decodeURIComponent(userDelete[1]));
 
-  if (path === "/api/projects" && method === "GET") return requireLogin(user, true) || json(await listProjects(env));
+  if (path === "/api/projects" && method === "GET") return json(await listProjects(env, user));
   const apiBuilds = path.match(/^\/api\/projects\/([^/]+)\/builds$/);
-  if (apiBuilds && method === "GET") return requireLogin(user, true) || json(await listBuilds(env, apiBuilds[1]));
+  if (apiBuilds && method === "GET") return json(await listBuilds(env, apiBuilds[1], user));
   if (apiBuilds && method === "POST") return requireRole(user, "admin", "dev", true) || legacyTooLargeResponse();
 
   const apiDelete = path.match(/^\/api\/projects\/([^/]+)$/);
@@ -106,7 +106,7 @@ async function dispatch(request, env, url, user) {
   if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2]);
 
   const manifest = path.match(/^\/builds\/([^/]+)\/manifest$/) || path.match(/^\/api\/builds\/([^/]+)\/manifest$/);
-  if (manifest && method === "GET") return requireLogin(user, true) || buildManifest(env, manifest[1]);
+  if (manifest && method === "GET") return buildManifest(env, manifest[1], user);
   const channel = path.match(/^\/builds\/([^/]+)\/channel$/) || path.match(/^\/api\/builds\/([^/]+)\/channel$/);
   if (channel && (method === "POST" || method === "PATCH")) return requireRole(user, "admin", "dev", "QA", true) || updateBuildChannel(request, env, user, channel[1]);
   const rollback = path.match(/^\/builds\/([^/]+)\/rollback$/);
@@ -181,15 +181,26 @@ async function logout(request, env) {
 
 async function dashboard(request, env, user) {
   const url = new URL(request.url);
-  const projects = await listProjects(env);
+  const projects = await listProjects(env, user);
   const selectedId = url.searchParams.get("project") || projects[0]?.id || null;
   const selected = selectedId ? await getProject(env, selectedId) : null;
-  const builds = selected ? await listBuilds(env, selected.id) : [];
+  const builds = selected ? await listBuilds(env, selected.id, user) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
   return html(renderDashboard({ user, projects, selected, builds, users }));
 }
 
-async function listProjects(env) {
+async function listProjects(env, user = null) {
+  if (!user) {
+    const { results } = await env.DB.prepare(
+      `SELECT projects.* FROM projects
+       WHERE EXISTS (
+         SELECT 1 FROM builds
+         WHERE builds.project_id = projects.id AND builds.channel = 'live'
+       )
+       ORDER BY projects.created_at DESC`
+    ).all();
+    return results || [];
+  }
   const { results } = await env.DB.prepare("SELECT * FROM projects ORDER BY created_at DESC").all();
   return results || [];
 }
@@ -198,8 +209,11 @@ async function getProject(env, id) {
   return env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
 }
 
-async function listBuilds(env, projectId) {
-  const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
+async function listBuilds(env, projectId, user = null) {
+  const statement = user
+    ? "SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC"
+    : "SELECT * FROM builds WHERE project_id = ? AND channel = 'live' ORDER BY created_at DESC";
+  const { results } = await env.DB.prepare(statement).bind(projectId).all();
   return (results || []).map(rowToBuild);
 }
 
@@ -237,7 +251,7 @@ async function deleteProjectJson(env, id) {
 }
 
 async function deleteProjectData(env, id) {
-  const builds = await listBuilds(env, id);
+  const builds = await listBuilds(env, id, { role: "admin" });
   const listed = await env.BUILDS_BUCKET.list({ prefix: `builds/${id}/` });
   await Promise.all((listed.objects || []).map(object => env.BUILDS_BUCKET.delete(object.key)));
   await env.DB.prepare("DELETE FROM builds WHERE project_id = ?").bind(id).run();
@@ -384,8 +398,11 @@ async function rollbackBuild(env, buildId) {
   return redirect(`/?project=${build?.project_id || ""}`);
 }
 
-async function buildManifest(env, buildId) {
-  const build = await env.DB.prepare("SELECT manifest_json FROM builds WHERE id = ?").bind(buildId).first();
+async function buildManifest(env, buildId, user = null) {
+  const statement = user
+    ? "SELECT manifest_json FROM builds WHERE id = ?"
+    : "SELECT manifest_json FROM builds WHERE id = ? AND channel = 'live'";
+  const build = await env.DB.prepare(statement).bind(buildId).first();
   if (!build) return json({ error: "build not found" }, 404);
   return json(JSON.parse(build.manifest_json));
 }
