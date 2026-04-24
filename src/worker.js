@@ -1,5 +1,6 @@
 const CHANNELS = ["dev", "qa", "live"];
 const USER_ROLES = ["admin", "dev", "QA", "viewer"];
+const PASSWORD_HASH_ITERATIONS = 100000;
 
 const encoder = new TextEncoder();
 
@@ -461,7 +462,11 @@ async function verifyPassword(password, stored) {
 
 async function pbkdf2(password, salt) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 120000, hash: "SHA-256" }, key, 256);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: PASSWORD_HASH_ITERATIONS, hash: "SHA-256" },
+    key,
+    256
+  );
   return new Uint8Array(bits);
 }
 

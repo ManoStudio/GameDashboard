@@ -9,6 +9,8 @@ It uses:
 - Cloudflare R2 for build artifacts
 - Direct browser-to-R2 uploads through presigned PUT URLs
 
+Password hashes use PBKDF2-SHA256 with 100,000 iterations, which is the maximum supported by Cloudflare Workers Web Crypto.
+
 ## 1. Create Cloudflare resources
 
 ```bash
