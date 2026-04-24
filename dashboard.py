@@ -4,14 +4,17 @@ import os
 import tempfile
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+import boto3
+from botocore.config import Config
 import firebase_admin
 from google.api_core import exceptions as google_exceptions
 from firebase_admin import credentials, firestore
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
 # Try to load environment variables from a .env file for local development.
 try:
@@ -357,6 +360,61 @@ def file_manifest_entry(path, content):
     }
 
 
+def r2_bucket_name():
+    return os.getenv("CLOUDFLARE_R2_BUCKET", "").strip()
+
+
+def r2_public_base_url():
+    return os.getenv("CLOUDFLARE_R2_PUBLIC_URL", "").strip().rstrip("/")
+
+
+def r2_client():
+    account_id = os.getenv("CLOUDFLARE_R2_ACCOUNT_ID", "").strip()
+    access_key = os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID", "").strip()
+    secret_key = os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", "").strip()
+    if not account_id or not access_key or not secret_key or not r2_bucket_name():
+        raise RuntimeError("Cloudflare R2 is not configured")
+
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def r2_configured():
+    return bool(
+        os.getenv("CLOUDFLARE_R2_ACCOUNT_ID", "").strip()
+        and os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID", "").strip()
+        and os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", "").strip()
+        and r2_bucket_name()
+    )
+
+
+def safe_upload_name(name, index):
+    filename = secure_filename(name or f"build-file-{index}")
+    return filename or f"build-file-{index}"
+
+
+def build_object_path(project_id, build_id, filename, index):
+    return f"builds/{project_id}/{build_id}/files/{index:03d}-{safe_upload_name(filename, index)}"
+
+
+def signed_upload_url(object_path, content_type):
+    return r2_client().generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": r2_bucket_name(),
+            "Key": object_path,
+            "ContentType": content_type or "application/octet-stream",
+        },
+        ExpiresIn=1800,
+    )
+
+
 def manifest_from_uploads(uploads):
     entries = []
 
@@ -396,6 +454,30 @@ def manifest_from_uploads(uploads):
     return {
         "generated_at": now_iso(),
         "source": filename,
+        "file_count": len(entries),
+        "total_size": total_size,
+        "files": entries,
+    }
+
+
+def manifest_from_uploaded_files(files):
+    entries = []
+    for item in files:
+        entries.append(
+            {
+                "path": item.get("name", "build.bin").replace("\\", "/"),
+                "hash": item.get("hash", ""),
+                "size": int(item.get("size", 0) or 0),
+                "content_type": item.get("content_type", "application/octet-stream"),
+                "storage_object": item.get("object_path", ""),
+                "storage_url": f"gs://{storage_bucket().name}/{item.get('object_path', '')}",
+            }
+        )
+
+    total_size = sum(entry["size"] for entry in entries)
+    return {
+        "generated_at": now_iso(),
+        "source": "firebase-storage-upload",
         "file_count": len(entries),
         "total_size": total_size,
         "files": entries,
@@ -457,17 +539,19 @@ def delete_project(project_id):
     if writes:
         batch.commit()
 
+    for blob in storage_bucket().list_blobs(prefix=f"builds/{project_id}/"):
+        blob.delete()
+
     return deleted_builds
 
 
-def save_build(project_id, form, uploads):
-    build_id = f"build-{uuid.uuid4().hex[:12]}"
-    version = next_version(project_id, form.get("version", "").strip())
+def save_build_record(project_id, form, manifest, build_id=None, version=None):
+    build_id = build_id or f"build-{uuid.uuid4().hex[:12]}"
+    version = version or next_version(project_id, form.get("version", "").strip())
     channel = form.get("channel", "dev")
     if channel not in CHANNELS:
         channel = "dev"
 
-    manifest = manifest_from_uploads(uploads)
     build = {
         "project_id": project_id,
         "version": version,
@@ -491,6 +575,10 @@ def save_build(project_id, form, uploads):
 
     build["id"] = build_id
     return build
+
+
+def save_build(project_id, form, uploads):
+    return save_build_record(project_id, form, manifest_from_uploads(uploads))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -597,6 +685,76 @@ def api_remove_project(project_id):
 
     deleted_builds = delete_project(project_id)
     return jsonify({"id": project_id, "deleted_builds": deleted_builds})
+
+
+@app.route("/api/projects/<project_id>/uploads/init", methods=["POST"])
+@role_required("admin", "dev")
+def init_storage_upload(project_id):
+    if db is None:
+        return jsonify({"error": "Firebase Storage is not configured"}), 503
+    if not get_project(project_id):
+        return jsonify({"error": "project not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    channel = payload.get("channel", "dev")
+    if channel not in CHANNELS:
+        return jsonify({"error": "invalid channel"}), 400
+    if not can_assign_channel(current_user().get("role"), channel):
+        return jsonify({"error": "forbidden"}), 403
+
+    files = payload.get("files") or []
+    if not files:
+        return jsonify({"error": "files are required"}), 400
+
+    build_id = f"build-{uuid.uuid4().hex[:12]}"
+    version = next_version(project_id, payload.get("version", "").strip())
+    uploads = []
+    for index, item in enumerate(files, start=1):
+        content_type = item.get("content_type") or "application/octet-stream"
+        object_path = build_object_path(project_id, build_id, item.get("name", ""), index)
+        uploads.append(
+            {
+                "name": item.get("name", ""),
+                "size": int(item.get("size", 0) or 0),
+                "content_type": content_type,
+                "object_path": object_path,
+                "upload_url": signed_upload_url(object_path, content_type),
+            }
+        )
+
+    return jsonify(
+        {
+            "build_id": build_id,
+            "version": version,
+            "bucket": storage_bucket().name,
+            "expires_in_seconds": 1800,
+            "uploads": uploads,
+        }
+    )
+
+
+@app.route("/api/projects/<project_id>/uploads/<build_id>/complete", methods=["POST"])
+@role_required("admin", "dev")
+def complete_storage_upload(project_id, build_id):
+    if db is None:
+        return jsonify({"error": "Firebase Storage is not configured"}), 503
+    if not get_project(project_id):
+        return jsonify({"error": "project not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    channel = payload.get("channel", "dev")
+    if channel not in CHANNELS:
+        return jsonify({"error": "invalid channel"}), 400
+    if not can_assign_channel(current_user().get("role"), channel):
+        return jsonify({"error": "forbidden"}), 403
+
+    files = payload.get("files") or []
+    if not files:
+        return jsonify({"error": "files are required"}), 400
+
+    manifest = manifest_from_uploaded_files(files)
+    build = save_build_record(project_id, payload, manifest, build_id=build_id, version=payload.get("version"))
+    return jsonify(build), 201
 
 
 @app.route("/projects/<project_id>/builds", methods=["POST"])

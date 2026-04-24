@@ -1,0 +1,9 @@
+[
+  {
+    "AllowedOrigins": ["https://game-dashboard.<your-subdomain>.workers.dev", "http://localhost:8787"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["content-type"],
+    "ExposeHeaders": ["etag"],
+    "MaxAgeSeconds": 3600
+  }
+]

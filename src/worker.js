@@ -1,0 +1,502 @@
+const CHANNELS = ["dev", "qa", "live"];
+const USER_ROLES = ["admin", "dev", "QA", "viewer"];
+
+const encoder = new TextEncoder();
+
+export default {
+  async fetch(request, env) {
+    try {
+      await bootstrapAdmin(env);
+      const url = new URL(request.url);
+      const user = await currentUser(request, env);
+      const route = await dispatch(request, env, url, user);
+      return route || notFound();
+    } catch (error) {
+      return html(`<h1>Server Error</h1><pre>${escapeHtml(error.stack || error.message)}</pre>`, 500);
+    }
+  },
+};
+
+async function dispatch(request, env, url, user) {
+  const path = url.pathname;
+  const method = request.method;
+
+  if (path === "/login" && method === "GET") return loginPage();
+  if (path === "/login" && method === "POST") return login(request, env);
+  if (path === "/logout" && method === "POST") return logout(request, env);
+  if (path === "/" && method === "GET") return requireLogin(user) || dashboard(request, env, user);
+
+  if (path === "/projects" && method === "POST") return requireRole(user, "admin") || createProject(request, env);
+  const projectUpdate = path.match(/^\/projects\/([^/]+)$/);
+  if (projectUpdate && method === "POST") return requireRole(user, "admin") || updateProject(request, env, projectUpdate[1]);
+  const projectDelete = path.match(/^\/projects\/([^/]+)\/delete$/);
+  if (projectDelete && method === "POST") return requireRole(user, "admin") || deleteProject(request, env, projectDelete[1]);
+
+  if (path === "/users" && method === "POST") return requireRole(user, "admin") || upsertUser(request, env);
+
+  if (path === "/api/projects" && method === "GET") return requireLogin(user, true) || json(await listProjects(env));
+  const apiBuilds = path.match(/^\/api\/projects\/([^/]+)\/builds$/);
+  if (apiBuilds && method === "GET") return requireLogin(user, true) || json(await listBuilds(env, apiBuilds[1]));
+  if (apiBuilds && method === "POST") return requireRole(user, "admin", "dev", true) || legacyTooLargeResponse();
+
+  const apiDelete = path.match(/^\/api\/projects\/([^/]+)$/);
+  if (apiDelete && method === "DELETE") return requireRole(user, "admin", true) || deleteProjectJson(env, apiDelete[1]);
+
+  const initUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/init$/);
+  if (initUpload && method === "POST") return requireRole(user, "admin", "dev", true) || initUploadSession(request, env, user, initUpload[1]);
+  const completeUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/([^/]+)\/complete$/);
+  if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2]);
+
+  const manifest = path.match(/^\/builds\/([^/]+)\/manifest$/) || path.match(/^\/api\/builds\/([^/]+)\/manifest$/);
+  if (manifest && method === "GET") return requireLogin(user, true) || buildManifest(env, manifest[1]);
+  const channel = path.match(/^\/builds\/([^/]+)\/channel$/) || path.match(/^\/api\/builds\/([^/]+)\/channel$/);
+  if (channel && (method === "POST" || method === "PATCH")) return requireRole(user, "admin", "dev", "QA", true) || updateBuildChannel(request, env, user, channel[1]);
+  const rollback = path.match(/^\/builds\/([^/]+)\/rollback$/);
+  if (rollback && method === "POST") return requireRole(user, "admin") || rollbackBuild(env, rollback[1]);
+
+  return null;
+}
+
+async function bootstrapAdmin(env) {
+  if (!env.ADMIN_EMAIL || !env.ADMIN_PASSWORD) return;
+  const email = env.ADMIN_EMAIL.trim().toLowerCase();
+  const existing = await env.DB.prepare("SELECT email FROM users WHERE email = ?").bind(email).first();
+  if (existing) return;
+  const now = nowIso();
+  await env.DB.prepare(
+    "INSERT INTO users (email, role, password_hash, created_at, updated_at) VALUES (?, 'admin', ?, ?, ?)"
+  ).bind(email, await hashPassword(env.ADMIN_PASSWORD), now, now).run();
+}
+
+async function currentUser(request, env) {
+  const tokenUser = apiTokenUser(request, env);
+  if (tokenUser) return tokenUser;
+  const token = cookie(request, "sid");
+  if (!token) return null;
+  const tokenHash = await sha256Hex(token);
+  const session = await env.DB.prepare(
+    "SELECT sessions.email, users.role FROM sessions JOIN users ON users.email = sessions.email WHERE token_hash = ? AND expires_at > ?"
+  ).bind(tokenHash, nowIso()).first();
+  return session ? { email: session.email, role: session.role } : null;
+}
+
+function apiTokenUser(request, env) {
+  const expected = env.DASHBOARD_API_TOKEN;
+  const header = request.headers.get("Authorization") || "";
+  if (!expected || header !== `Bearer ${expected}`) return null;
+  return { email: "api-token", role: "admin" };
+}
+
+function requireLogin(user, asJson = false) {
+  if (user) return null;
+  return asJson ? json({ error: "unauthorized" }, 401) : redirect("/login");
+}
+
+function requireRole(user, ...rolesAndMaybeJson) {
+  const asJson = rolesAndMaybeJson[rolesAndMaybeJson.length - 1] === true;
+  const roles = asJson ? rolesAndMaybeJson.slice(0, -1) : rolesAndMaybeJson;
+  if (!user) return requireLogin(user, asJson);
+  if (!roles.includes(user.role)) return asJson ? json({ error: "forbidden" }, 403) : redirect("/");
+  return null;
+}
+
+async function login(request, env) {
+  const form = await request.formData();
+  const email = String(form.get("email") || "").trim().toLowerCase();
+  const password = String(form.get("password") || "");
+  const user = await env.DB.prepare("SELECT email, password_hash FROM users WHERE email = ?").bind(email).first();
+  if (!user || !(await verifyPassword(password, user.password_hash))) return loginPage("Invalid email or password");
+  const token = crypto.randomUUID() + crypto.randomUUID();
+  const now = new Date();
+  const expires = new Date(now.getTime() + 7 * 86400 * 1000);
+  await env.DB.prepare("INSERT INTO sessions (token_hash, email, expires_at, created_at) VALUES (?, ?, ?, ?)")
+    .bind(await sha256Hex(token), email, expires.toISOString(), now.toISOString())
+    .run();
+  return redirect("/", { "Set-Cookie": `sid=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800` });
+}
+
+async function logout(request, env) {
+  const token = cookie(request, "sid");
+  if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256Hex(token)).run();
+  return redirect("/login", { "Set-Cookie": "sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" });
+}
+
+async function dashboard(request, env, user) {
+  const url = new URL(request.url);
+  const projects = await listProjects(env);
+  const selectedId = url.searchParams.get("project") || projects[0]?.id || null;
+  const selected = selectedId ? await getProject(env, selectedId) : null;
+  const builds = selected ? await listBuilds(env, selected.id) : [];
+  const users = user.role === "admin" ? await listUsers(env) : [];
+  return html(renderDashboard({ user, projects, selected, builds, users }));
+}
+
+async function listProjects(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM projects ORDER BY created_at DESC").all();
+  return results || [];
+}
+
+async function getProject(env, id) {
+  return env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
+}
+
+async function listBuilds(env, projectId) {
+  const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
+  return (results || []).map(rowToBuild);
+}
+
+async function listUsers(env) {
+  const { results } = await env.DB.prepare("SELECT email, role, created_at, updated_at FROM users ORDER BY email").all();
+  return results || [];
+}
+
+async function createProject(request, env) {
+  const form = await request.formData();
+  const id = `project-${crypto.randomUUID().slice(0, 8)}`;
+  const now = nowIso();
+  await env.DB.prepare(
+    "INSERT INTO projects (id, name, icon, bundle_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "dev", now, now).run();
+  return redirect(`/?project=${id}`);
+}
+
+async function updateProject(request, env, id) {
+  const form = await request.formData();
+  await env.DB.prepare("UPDATE projects SET name = ?, icon = ?, bundle_id = ?, role = ?, updated_at = ? WHERE id = ?")
+    .bind(field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "dev", nowIso(), id)
+    .run();
+  return redirect(`/?project=${id}`);
+}
+
+async function deleteProject(request, env, id) {
+  await deleteProjectData(env, id);
+  return redirect("/");
+}
+
+async function deleteProjectJson(env, id) {
+  const deletedBuilds = await deleteProjectData(env, id);
+  return json({ id, deleted_builds: deletedBuilds });
+}
+
+async function deleteProjectData(env, id) {
+  const builds = await listBuilds(env, id);
+  const listed = await env.BUILDS_BUCKET.list({ prefix: `builds/${id}/` });
+  await Promise.all((listed.objects || []).map(object => env.BUILDS_BUCKET.delete(object.key)));
+  await env.DB.prepare("DELETE FROM builds WHERE project_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM projects WHERE id = ?").bind(id).run();
+  return builds.length;
+}
+
+async function upsertUser(request, env) {
+  const form = await request.formData();
+  const email = field(form, "email").toLowerCase();
+  const role = USER_ROLES.includes(field(form, "role")) ? field(form, "role") : "viewer";
+  const password = field(form, "password");
+  const existing = await env.DB.prepare("SELECT email FROM users WHERE email = ?").bind(email).first();
+  const now = nowIso();
+  if (!existing && !password) return redirect("/");
+  if (existing && !password) {
+    await env.DB.prepare("UPDATE users SET role = ?, updated_at = ? WHERE email = ?").bind(role, now, email).run();
+  } else {
+    await env.DB.prepare(
+      "INSERT INTO users (email, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET role = excluded.role, password_hash = excluded.password_hash, updated_at = excluded.updated_at"
+    ).bind(email, role, await hashPassword(password), now, now).run();
+  }
+  return redirect("/");
+}
+
+async function initUploadSession(request, env, user, projectId) {
+  const payload = await request.json();
+  const channel = payload.channel || "dev";
+  if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
+  if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
+  const files = payload.files || [];
+  if (!files.length) return json({ error: "files are required" }, 400);
+  const buildId = `build-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const version = payload.version || await nextVersion(env, projectId);
+  const uploads = [];
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    const contentType = file.content_type || "application/octet-stream";
+    const objectPath = objectPathFor(projectId, buildId, file.name, index + 1);
+    uploads.push({
+      name: file.name || "",
+      size: Number(file.size || 0),
+      content_type: contentType,
+      object_path: objectPath,
+      upload_url: await presignPut(env, objectPath, contentType),
+    });
+  }
+  return json({ build_id: buildId, version, bucket: env.R2_BUCKET_NAME, expires_in_seconds: 1800, uploads });
+}
+
+async function completeUploadSession(request, env, user, projectId, buildId) {
+  const payload = await request.json();
+  const channel = payload.channel || "dev";
+  if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
+  if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
+  const files = payload.files || [];
+  if (!files.length) return json({ error: "files are required" }, 400);
+  const manifest = {
+    generated_at: nowIso(),
+    source: "cloudflare-r2-upload",
+    file_count: files.length,
+    total_size: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
+    files: files.map(file => ({
+      path: file.name || "build.bin",
+      hash: file.hash || "",
+      size: Number(file.size || 0),
+      content_type: file.content_type || "application/octet-stream",
+      storage_object: file.object_path,
+      storage_url: publicObjectUrl(env, file.object_path),
+    })),
+  };
+  const build = await saveBuild(env, projectId, buildId, payload, manifest);
+  return json(build, 201);
+}
+
+async function saveBuild(env, projectId, buildId, payload, manifest) {
+  const now = nowIso();
+  const version = payload.version || await nextVersion(env, projectId);
+  const channel = CHANNELS.includes(payload.channel) ? payload.channel : "dev";
+  await env.DB.prepare(
+    "INSERT INTO builds (id, project_id, version, channel, tag, changelog, status, file_count, total_size, storage_path, manifest_path, manifest_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(
+    buildId,
+    projectId,
+    version,
+    channel,
+    payload.tag || "",
+    payload.changelog || "Manual upload",
+    manifest.file_count,
+    manifest.total_size,
+    `r2://${env.R2_BUCKET_NAME}/builds/${projectId}/${buildId}/files`,
+    `r2://${env.R2_BUCKET_NAME}/builds/${projectId}/${buildId}/manifest.json`,
+    JSON.stringify(manifest),
+    now,
+    now
+  ).run();
+  return rowToBuild(await env.DB.prepare("SELECT * FROM builds WHERE id = ?").bind(buildId).first());
+}
+
+async function updateBuildChannel(request, env, user, buildId) {
+  const payload = request.headers.get("content-type")?.includes("application/json")
+    ? await request.json()
+    : Object.fromEntries(await request.formData());
+  const channel = payload.channel || "dev";
+  if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
+  if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
+  await env.DB.prepare("UPDATE builds SET channel = ?, status = 'assigned', updated_at = ? WHERE id = ?").bind(channel, nowIso(), buildId).run();
+  const build = await env.DB.prepare("SELECT project_id FROM builds WHERE id = ?").bind(buildId).first();
+  return request.url.includes("/api/") ? json({ id: buildId, channel }) : redirect(`/?project=${build?.project_id || ""}`);
+}
+
+async function rollbackBuild(env, buildId) {
+  const build = await env.DB.prepare("SELECT project_id FROM builds WHERE id = ?").bind(buildId).first();
+  await env.DB.prepare("UPDATE builds SET channel = 'live', tag = 'rollback', updated_at = ? WHERE id = ?").bind(nowIso(), buildId).run();
+  return redirect(`/?project=${build?.project_id || ""}`);
+}
+
+async function buildManifest(env, buildId) {
+  const build = await env.DB.prepare("SELECT manifest_json FROM builds WHERE id = ?").bind(buildId).first();
+  if (!build) return json({ error: "build not found" }, 404);
+  return json(JSON.parse(build.manifest_json));
+}
+
+async function nextVersion(env, projectId) {
+  const latest = await env.DB.prepare("SELECT version FROM builds WHERE project_id = ? ORDER BY created_at DESC LIMIT 1").bind(projectId).first();
+  if (!latest) return "1.0.0";
+  const parts = latest.version.split(".").map(part => Number(part));
+  return parts.length === 3 && parts.every(Number.isInteger) ? `${parts[0]}.${parts[1]}.${parts[2] + 1}` : `${latest.version}.1`;
+}
+
+function rowToBuild(row) {
+  return row ? { ...row, manifest: row.manifest_json ? JSON.parse(row.manifest_json) : null } : null;
+}
+
+function canAssign(role, channel) {
+  if (role === "admin") return true;
+  if (role === "dev") return channel === "dev" || channel === "qa";
+  if (role === "QA") return channel === "qa";
+  return false;
+}
+
+async function presignPut(env, key, contentType) {
+  const host = `${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const bucket = env.R2_BUCKET_NAME;
+  const path = `/${bucket}/${encodeURIComponent(key).replaceAll("%2F", "/")}`;
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/auto/s3/aws4_request`;
+  const credential = `${env.R2_ACCESS_KEY_ID}/${credentialScope}`;
+  const params = new URLSearchParams({
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": credential,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": "1800",
+    "X-Amz-SignedHeaders": "content-type;host",
+  });
+  const canonicalQuery = [...params.entries()].map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).sort().join("&");
+  const canonicalHeaders = `content-type:${contentType}\nhost:${host}\n`;
+  const canonicalRequest = ["PUT", path, canonicalQuery, canonicalHeaders, "content-type;host", "UNSIGNED-PAYLOAD"].join("\n");
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, await sha256Hex(canonicalRequest)].join("\n");
+  const signingKey = await signatureKey(env.R2_SECRET_ACCESS_KEY, dateStamp, "auto", "s3");
+  const signature = await hmacHex(signingKey, stringToSign);
+  return `https://${host}${path}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+}
+
+async function signatureKey(secret, dateStamp, region, service) {
+  const kDate = await hmacBytes(encoder.encode(`AWS4${secret}`), dateStamp);
+  const kRegion = await hmacBytes(kDate, region);
+  const kService = await hmacBytes(kRegion, service);
+  return hmacBytes(kService, "aws4_request");
+}
+
+function publicObjectUrl(env, key) {
+  const base = (env.R2_PUBLIC_URL || "").replace(/\/$/, "");
+  return base ? `${base}/${key}` : `r2://${env.R2_BUCKET_NAME}/${key}`;
+}
+
+function objectPathFor(projectId, buildId, filename, index) {
+  const clean = (filename || `build-file-${index}`).replace(/[^\w.\-]+/g, "_") || `build-file-${index}`;
+  return `builds/${projectId}/${buildId}/files/${String(index).padStart(3, "0")}-${clean}`;
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt);
+  return `pbkdf2:${bytesToHex(salt)}:${bytesToHex(hash)}`;
+}
+
+async function verifyPassword(password, stored) {
+  const [, saltHex, hashHex] = String(stored || "").split(":");
+  if (!saltHex || !hashHex) return false;
+  const hash = await pbkdf2(password, hexToBytes(saltHex));
+  return bytesToHex(hash) === hashHex;
+}
+
+async function pbkdf2(password, salt) {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 120000, hash: "SHA-256" }, key, 256);
+  return new Uint8Array(bits);
+}
+
+async function sha256Hex(value) {
+  const data = typeof value === "string" ? encoder.encode(value) : value;
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", data)));
+}
+
+async function hmacBytes(keyBytes, value) {
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value)));
+}
+
+async function hmacHex(keyBytes, value) {
+  return bytesToHex(await hmacBytes(keyBytes, value));
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex) {
+  return new Uint8Array(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+}
+
+function field(form, name) {
+  return String(form.get(name) || "").trim();
+}
+
+function cookie(request, name) {
+  return Object.fromEntries((request.headers.get("Cookie") || "").split(";").map(part => {
+    const [key, ...value] = part.trim().split("=");
+    return [key, value.join("=")];
+  }))[name];
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function redirect(location, headers = {}) {
+  return new Response(null, { status: 302, headers: { Location: location, ...headers } });
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+}
+
+function html(body, status = 200) {
+  return new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+function notFound() {
+  return html("<h1>Not Found</h1>", 404);
+}
+
+function legacyTooLargeResponse() {
+  return json({ error: "Use /uploads/init direct-to-R2 upload flow for build files." }, 400);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+}
+
+function loginPage(error = "") {
+  return html(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title>${style()}</head><body><main class="login panel"><div class="brand"><div class="mark">BP</div><div><h1>Build Producer</h1><p>Cloudflare dashboard</p></div></div>${error ? `<div class="alert">${escapeHtml(error)}</div>` : ""}<form method="post" class="form-grid" data-loading-steps="Checking credentials|Creating session|Opening dashboard"><label class="field"><span class="label">Email</span><input name="email" type="email" required autofocus></label><label class="field"><span class="label">Password</span><input name="password" type="password" required></label><button class="button">Login</button></form></main>${loaderScript()}</body></html>`);
+}
+
+function renderDashboard({ user, projects, selected, builds, users }) {
+  const latest = builds[0];
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Build Producer Dashboard</title>${style()}</head><body><div class="shell"><aside class="sidebar"><div class="brand"><div class="mark">BP</div><div><h1>Build Producer</h1><p>Cloudflare R2 + D1</p></div></div><div class="account"><strong>${escapeHtml(user.email)}</strong><span>role: ${escapeHtml(user.role)}</span><form method="post" action="/logout" data-loading-steps="Signing out|Clearing session"><button class="button secondary">Logout</button></form></div><div><div class="tiny">Projects</div><nav class="project-list">${projects.map(project => `<a class="project-link ${selected?.id === project.id ? "active" : ""}" href="/?project=${project.id}" data-loading-steps="Opening project|Loading builds"><div class="project-icon">${escapeHtml(project.icon.slice(0, 2).toUpperCase())}</div><div class="truncate"><strong>${escapeHtml(project.name)}</strong><span>${escapeHtml(project.bundle_id)}</span></div></a>`).join("")}</nav></div>${user.role === "admin" ? createProjectForm() : ""}</aside><main class="main">${selected ? projectView(user, selected, builds, latest, users) : emptyView()}</main></div>${softLoad()}${dashboardScript()}</body></html>`;
+}
+
+function createProjectForm() {
+  return `<form class="form-grid" method="post" action="/projects" data-loading-steps="Creating project|Saving project data|Refreshing dashboard"><h3>Create Project</h3><label class="field"><span class="label">Project name</span><input name="name" required></label><label class="field"><span class="label">Icon</span><input name="icon" maxlength="4" placeholder="GM"></label><label class="field"><span class="label">Bundle ID</span><input name="bundle_id" required></label><label class="field"><span class="label">Role</span><select name="role">${["admin", "dev", "QA"].map(role => `<option>${role}</option>`).join("")}</select></label><button class="button">+ Project</button></form>`;
+}
+
+function projectView(user, project, builds, latest, users) {
+  return `<section class="topbar"><div><div class="label">Dashboard API / R2 Storage / D1 Metadata / Role Auth</div><h2>${escapeHtml(project.name)}</h2><p>${escapeHtml(project.bundle_id)}</p></div><div class="actions">${latest ? `<a class="button secondary" href="/builds/${latest.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>` : ""}<a class="button secondary" href="/api/projects/${project.id}/builds" data-loading-steps="Opening API response|Loading project builds">API</a></div></section><section class="grid"><div class="panel">${projectManagement(user, project, builds, latest)}</div>${["admin", "dev"].includes(user.role) ? uploadPanel(user, project) : ""}</section>${user.role === "admin" ? userAccess(users) : ""}${buildHistory(user, project, builds)}`;
+}
+
+function projectManagement(user, project, builds, latest) {
+  return `<div class="summary"><div class="project-icon">${escapeHtml(project.icon.slice(0, 2).toUpperCase())}</div><div><h3>Project Management</h3><p>role: ${escapeHtml(project.role)}</p></div></div>${user.role === "admin" ? `<form class="form-grid" method="post" action="/projects/${project.id}" data-loading-steps="Saving project|Updating D1|Refreshing dashboard"><label class="field"><span class="label">Project name</span><input name="name" value="${escapeHtml(project.name)}" required></label><label class="field"><span class="label">Icon</span><input name="icon" value="${escapeHtml(project.icon)}" maxlength="4"></label><label class="field"><span class="label">Bundle ID</span><input name="bundle_id" value="${escapeHtml(project.bundle_id)}" required></label><label class="field"><span class="label">Access role</span><select name="role">${["admin", "dev", "QA"].map(role => `<option ${project.role === role ? "selected" : ""}>${role}</option>`).join("")}</select></label><button class="button">Save Project</button></form><form method="post" action="/projects/${project.id}/delete" data-confirm="Delete this project and all builds?" data-loading-steps="Deleting R2 files|Removing project|Refreshing dashboard"><button class="button danger">Delete Project</button></form>` : ""}<div class="stats"><div class="stat"><strong>${builds.length}</strong><span>builds</span></div><div class="stat"><strong>${latest?.channel || "-"}</strong><span>latest channel</span></div><div class="stat"><strong>${latest?.version || "-"}</strong><span>version</span></div></div>`;
+}
+
+function uploadPanel(user, project) {
+  return `<div class="panel"><h3>Build Upload</h3><form class="form-grid" data-direct-upload="true" data-init-url="/api/projects/${project.id}/uploads/init" data-complete-base="/api/projects/${project.id}/uploads" data-return-url="/?project=${project.id}" data-loading-steps="Preparing R2 upload|Hashing files|Uploading files|Saving build"><label class="dropzone"><input type="file" name="build" multiple required><span><strong>Drop build zip here</strong><span>Files upload directly to Cloudflare R2.</span></span></label><div class="form-grid trio"><label class="field"><span class="label">Version</span><input name="version" placeholder="auto"></label><label class="field"><span class="label">Channel</span><select name="channel">${CHANNELS.filter(c => user.role === "admin" || c !== "live").map(c => `<option>${c}</option>`).join("")}</select></label><label class="field"><span class="label">Tag</span><input name="tag" placeholder="hotfix / stable"></label></div><label class="field"><span class="label">Changelog</span><textarea name="changelog"></textarea></label><button class="button">Upload Build</button></form></div>`;
+}
+
+function userAccess(users) {
+  return `<section class="panel"><h3>User Access</h3><form class="form-grid" method="post" action="/users" data-loading-steps="Saving user|Updating role|Refreshing access list"><div class="form-grid trio"><label class="field"><span class="label">Email</span><input name="email" type="email" required></label><label class="field"><span class="label">Password</span><input name="password" type="password" placeholder="keep blank to preserve"></label><label class="field"><span class="label">Role</span><select name="role">${USER_ROLES.map(role => `<option>${role}</option>`).join("")}</select></label></div><button class="button">Save User</button></form><div class="user-list">${users.map(u => `<div class="stat"><strong>${escapeHtml(u.email)}</strong><span>role: ${escapeHtml(u.role)}</span></div>`).join("")}</div></section>`;
+}
+
+function buildHistory(user, project, builds) {
+  return `<section class="panel"><div class="build-head"><div><h3>Build History</h3><p>Rollback promotes a selected build back to live.</p></div><div class="code">POST /api/projects/${project.id}/uploads/init</div></div>${builds.length ? `<div class="build-list">${builds.map(build => buildCard(user, build)).join("")}</div>` : `<div class="empty">No builds yet.</div>`}</section>`;
+}
+
+function buildCard(user, build) {
+  const channels = CHANNELS.filter(channel => canAssign(user.role, channel));
+  return `<article class="card"><div class="build-head"><div><h3>Version ${escapeHtml(build.version)}</h3><p>${escapeHtml(build.created_at)}</p></div><div class="badges"><span class="badge ${escapeHtml(build.channel)}">${escapeHtml(build.channel)}</span>${build.tag ? `<span class="badge tag">${escapeHtml(build.tag)}</span>` : ""}<span class="badge">${escapeHtml(build.status)}</span></div></div><div class="build-meta"><div class="stat"><strong>${build.file_count}</strong><span>files</span></div><div class="stat"><strong>${(build.total_size / 1048576).toFixed(2)}</strong><span>MB</span></div><div class="stat"><strong>${escapeHtml(build.channel)}</strong><span>channel</span></div><div class="stat"><strong>${escapeHtml(build.tag || "-")}</strong><span>tag</span></div></div><p>${escapeHtml(build.changelog || "")}</p><div class="code">${escapeHtml(build.storage_path)} | ${escapeHtml(build.manifest_path)}</div><div class="split-actions">${channels.length ? `<form class="inline-form" method="post" action="/builds/${build.id}/channel" data-loading-steps="Assigning channel|Updating build status|Refreshing history"><select name="channel">${channels.map(c => `<option ${build.channel === c ? "selected" : ""}>${c}</option>`).join("")}</select><button class="icon-button">&rarr;</button></form>` : ""}<div class="actions"><a class="button secondary" href="/builds/${build.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>${user.role === "admin" ? `<form method="post" action="/builds/${build.id}/rollback" data-loading-steps="Starting rollback|Promoting build to live|Refreshing history"><button class="button secondary">Rollback</button></form>` : ""}</div></div></article>`;
+}
+
+function emptyView() {
+  return `<section class="panel empty"><div><h2>Create your first project</h2><p>Add a project to start uploading builds and generating manifests.</p></div></section>`;
+}
+
+function style() {
+  return `<style>:root{--ink:#16211f;--muted:#5d6d66;--line:#dce5df;--panel:#fff;--page:#f4f7f2;--lime:#b7ff5a;--green:#188a55;--cyan:#1aa6b7;--rose:#ca3f64;--amber:#af7c18;--charcoal:#1f2a27;--shadow:0 16px 40px rgba(31,42,39,.08)}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--page);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit}button{border:0;cursor:pointer}.shell{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.sidebar{background:var(--charcoal);color:#f8fff9;padding:24px;display:flex;flex-direction:column;gap:24px}.brand{display:flex;align-items:center;gap:12px}.mark,.project-icon{width:44px;height:44px;border-radius:8px;display:grid;place-items:center;background:var(--lime);color:var(--charcoal);font-weight:800}.brand h1{margin:0;font-size:19px;line-height:1.1}.brand p,.tiny,.sidebar span{color:#a9bab2;margin:0}.account{display:grid;gap:10px;padding:12px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:rgba(255,255,255,.08)}.project-list{display:grid;gap:8px}.project-link{display:grid;grid-template-columns:36px minmax(0,1fr);gap:10px;align-items:center;padding:10px;color:#f8fff9;text-decoration:none;border-radius:8px;border:1px solid transparent}.project-link:hover,.project-link.active{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.16)}.project-link .project-icon{width:36px;height:36px;font-size:13px}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.main{padding:26px;display:grid;gap:22px;align-content:start}.topbar,.build-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}h2,h3{margin:0}h2{font-size:clamp(28px,4vw,44px);line-height:1}.actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end}.button,.icon-button{min-height:40px;border-radius:8px;background:var(--charcoal);color:#fff;padding:0 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;font-weight:700}.button.secondary{background:#fff;color:var(--ink);border:1px solid var(--line)}.button.danger{background:var(--rose)}.icon-button{width:40px;padding:0}.grid{display:grid;grid-template-columns:minmax(280px,1.05fr) minmax(320px,1.8fr);gap:18px;align-items:start}.panel,.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.panel{padding:18px;display:grid;gap:16px}.summary{display:grid;grid-template-columns:72px minmax(0,1fr);gap:14px;align-items:center}.summary .project-icon{width:72px;height:72px;font-size:20px}.stats,.build-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.build-meta{grid-template-columns:repeat(4,minmax(0,1fr))}.stat{border:1px solid var(--line);border-radius:8px;padding:12px;min-height:76px}.stat strong{display:block;font-size:24px;line-height:1.1}.form-grid{display:grid;gap:10px}.trio{grid-template-columns:repeat(3,minmax(0,1fr))}.field{display:grid;gap:6px}.label{font-size:12px;font-weight:800;text-transform:uppercase;color:var(--muted)}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;background:#fbfdf9;color:var(--ink);padding:10px 12px;min-height:42px}textarea{min-height:88px;resize:vertical}.dropzone{position:relative;display:grid;place-items:center;min-height:150px;border:2px dashed #9fb2a8;border-radius:8px;background:#fbfff5;text-align:center;padding:18px}.dropzone input{position:absolute;inset:0;opacity:0;cursor:pointer}.build-list{display:grid;gap:12px}.card{padding:14px;display:grid;gap:12px}.badges{display:flex;flex-wrap:wrap;gap:6px}.badge{display:inline-flex;align-items:center;min-height:26px;border-radius:999px;padding:0 10px;font-size:12px;font-weight:800;background:#edf4ee;color:var(--green)}.badge.qa{color:var(--cyan)}.badge.live{color:var(--rose)}.badge.tag{color:var(--amber)}.code{overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#202825;color:#d8ffe4;padding:12px;font-family:Consolas,monospace;font-size:12px;white-space:nowrap;text-overflow:ellipsis}.split-actions{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px}.inline-form{display:flex;gap:8px;align-items:center}.inline-form select{width:auto;min-width:110px}.user-list{display:grid;gap:8px}.empty{min-height:240px;display:grid;place-items:center;text-align:center;color:var(--muted)}.login{width:min(420px,100%);margin:12vh auto;padding:22px}.soft-load{position:fixed;right:20px;bottom:20px;z-index:50;width:min(360px,calc(100vw - 36px));display:none;grid-template-columns:34px minmax(0,1fr);gap:12px;align-items:center;background:rgba(31,42,39,.96);color:#f8fff9;border:1px solid rgba(255,255,255,.16);border-radius:8px;box-shadow:var(--shadow);padding:14px}.soft-load.active{display:grid}.soft-load span{color:#b9cbc2;font-size:13px}.spinner{width:28px;height:28px;border:3px solid rgba(255,255,255,.24);border-top-color:var(--lime);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:980px){.shell{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}@media(max-width:640px){.main,.sidebar{padding:18px}.topbar,.build-head{display:grid}.trio,.stats,.build-meta{grid-template-columns:1fr}.button,.inline-form,.inline-form select{width:100%}}</style>`;
+}
+
+function softLoad() {
+  return `<div class="soft-load" id="softLoad" role="status" aria-live="polite" aria-hidden="true"><div class="spinner"></div><div><strong id="softLoadTitle">Working</strong><span id="softLoadStep">Please wait</span></div></div>`;
+}
+
+function loaderScript() {
+  return `${softLoad()}<script>const softLoad=document.getElementById("softLoad"),softLoadTitle=document.getElementById("softLoadTitle"),softLoadStep=document.getElementById("softLoadStep");function showSoftLoad(s,f){const a=s.filter(Boolean);softLoadTitle.textContent=a[0]||"Working";softLoadStep.textContent=a[1]||"Waiting for the server";softLoad.classList.add("active");f?.querySelectorAll("button").forEach(b=>{b.disabled=true;b.textContent="Working..."})}document.querySelectorAll("form[data-loading-steps]").forEach(f=>f.addEventListener("submit",()=>showSoftLoad(f.dataset.loadingSteps.split("|"),f)));</script>`;
+}
+
+function dashboardScript() {
+  return `<script>const softLoad=document.getElementById("softLoad"),softLoadTitle=document.getElementById("softLoadTitle"),softLoadStep=document.getElementById("softLoadStep");let timer=null;function showSoftLoad(steps,source){const s=steps.filter(Boolean);clearInterval(timer);let i=0;softLoadTitle.textContent=s[0]||"Working";softLoadStep.textContent=s[1]||"Waiting for the server";softLoad.classList.add("active");source?.querySelectorAll("button,input[type='submit']").forEach(b=>{b.disabled=true;b.dataset.originalText=b.textContent;b.textContent="Working..."});timer=setInterval(()=>{i=(i+1)%s.length;softLoadTitle.textContent=s[i];softLoadStep.textContent="Waiting for the request to complete"},1400)}function updateSoftLoad(t,s){softLoadTitle.textContent=t;softLoadStep.textContent=s||"Waiting for the request to complete"}function restoreForm(f){f.querySelectorAll("button,input[type='submit']").forEach(b=>{b.disabled=false;if(b.dataset.originalText)b.textContent=b.dataset.originalText})}async function sha256Hex(file){const buf=await file.arrayBuffer();const hash=await crypto.subtle.digest("SHA-256",buf);return Array.from(new Uint8Array(hash)).map(b=>b.toString(16).padStart(2,"0")).join("")}function payload(form){const d=new FormData(form);return{version:d.get("version")||"",channel:d.get("channel")||"dev",tag:d.get("tag")||"",changelog:d.get("changelog")||""}}async function uploadBuild(form){const files=Array.from(form.querySelector("input[type='file']").files||[]);if(!files.length)return;showSoftLoad(form.dataset.loadingSteps.split("|"),form);try{updateSoftLoad("Preparing R2 upload","Requesting signed URLs");const init=await fetch(form.dataset.initUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...payload(form),files:files.map(f=>({name:f.name,size:f.size,content_type:f.type||"application/octet-stream"}))})});if(!init.ok)throw new Error(await init.text());const session=await init.json();const uploaded=[];for(let i=0;i<files.length;i++){const file=files[i],target=session.uploads[i];updateSoftLoad("Hashing "+(i+1)+"/"+files.length,file.name);const hash=await sha256Hex(file);updateSoftLoad("Uploading "+(i+1)+"/"+files.length,file.name);const put=await fetch(target.upload_url,{method:"PUT",headers:{"Content-Type":target.content_type},body:file});if(!put.ok)throw new Error("R2 upload failed for "+file.name);uploaded.push({name:file.name,size:file.size,hash,content_type:target.content_type,object_path:target.object_path})}updateSoftLoad("Saving build","Writing manifest to D1");const done=await fetch(form.dataset.completeBase+"/"+session.build_id+"/complete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...payload(form),version:session.version,files:uploaded})});if(!done.ok)throw new Error(await done.text());location.href=form.dataset.returnUrl}catch(e){clearInterval(timer);updateSoftLoad("Upload failed",e.message);restoreForm(form)}}document.querySelectorAll("form[data-direct-upload='true']").forEach(f=>f.addEventListener("submit",e=>{e.preventDefault();uploadBuild(f)}));document.querySelectorAll("form[data-loading-steps]").forEach(f=>f.addEventListener("submit",e=>{if(f.dataset.directUpload==="true")return;if(f.dataset.confirm&&!confirm(f.dataset.confirm)){e.preventDefault();return}showSoftLoad(f.dataset.loadingSteps.split("|"),f)}));document.querySelectorAll("a[data-loading-steps]").forEach(a=>a.addEventListener("click",()=>showSoftLoad(a.dataset.loadingSteps.split("|"),a)));</script>`;
+}

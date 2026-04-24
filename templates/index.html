@@ -699,13 +699,17 @@
                 <div class="panel">
                     <h3>Build Upload</h3>
                     <form class="form-grid" method="post" enctype="multipart/form-data"
+                        data-direct-upload="true"
+                        data-init-url="{{ url_for('init_storage_upload', project_id=selected_project.id) }}"
+                        data-complete-base="/api/projects/{{ selected_project.id }}/uploads"
+                        data-return-url="{{ url_for('index', project=selected_project.id) }}"
                         data-loading-steps="Uploading build|Reading files|Generating manifest|Saving build|Refreshing history"
                         action="{{ url_for('upload_build', project_id=selected_project.id) }}">
                         <label class="dropzone">
                             <input type="file" name="build" multiple required>
                             <span>
                                 <strong>Drop build zip here</strong>
-                                <span class="meta">CI can POST multipart form-data to this same endpoint.</span>
+                                <span class="meta">Files upload directly to Firebase Storage.</span>
                             </span>
                         </label>
                         <div class="form-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr));">
@@ -919,8 +923,130 @@
             }, 1400);
         }
 
+        function updateSoftLoad(title, step) {
+            softLoadTitle.textContent = title;
+            softLoadStep.textContent = step || "Waiting for the request to complete";
+        }
+
+        function restoreForm(form) {
+            document.body.classList.remove("is-loading");
+            form.classList.remove("is-loading");
+            form.querySelectorAll("button, input[type='submit']").forEach((button) => {
+                button.disabled = false;
+                if (button.dataset.originalText) {
+                    button.textContent = button.dataset.originalText;
+                    delete button.dataset.originalText;
+                }
+            });
+        }
+
+        async function sha256Hex(file) {
+            const buffer = await file.arrayBuffer();
+            const digest = await crypto.subtle.digest("SHA-256", buffer);
+            return Array.from(new Uint8Array(digest))
+                .map((byte) => byte.toString(16).padStart(2, "0"))
+                .join("");
+        }
+
+        function formPayload(form) {
+            const formData = new FormData(form);
+            return {
+                version: formData.get("version") || "",
+                channel: formData.get("channel") || "dev",
+                tag: formData.get("tag") || "",
+                changelog: formData.get("changelog") || "",
+            };
+        }
+
+        async function uploadBuildToStorage(form) {
+            const fileInput = form.querySelector("input[type='file']");
+            const files = Array.from(fileInput.files || []);
+            if (!files.length) {
+                return;
+            }
+
+            showSoftLoad(form.dataset.loadingSteps.split("|"), form);
+            try {
+                updateSoftLoad("Preparing upload", "Requesting Firebase Storage URLs");
+                const payload = {
+                    ...formPayload(form),
+                    files: files.map((file) => ({
+                        name: file.name,
+                        size: file.size,
+                        content_type: file.type || "application/octet-stream",
+                    })),
+                };
+                const initResponse = await fetch(form.dataset.initUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (!initResponse.ok) {
+                    throw new Error(await initResponse.text());
+                }
+
+                const uploadSession = await initResponse.json();
+                const uploadedFiles = [];
+                for (let index = 0; index < files.length; index += 1) {
+                    const file = files[index];
+                    const target = uploadSession.uploads[index];
+                    updateSoftLoad(`Hashing ${index + 1}/${files.length}`, file.name);
+                    const hash = await sha256Hex(file);
+
+                    updateSoftLoad(`Uploading ${index + 1}/${files.length}`, file.name);
+                    const uploadResponse = await fetch(target.upload_url, {
+                        method: "PUT",
+                        headers: { "Content-Type": target.content_type },
+                        body: file,
+                    });
+                    if (!uploadResponse.ok) {
+                        throw new Error(`Firebase Storage upload failed for ${file.name}`);
+                    }
+
+                    uploadedFiles.push({
+                        name: file.name,
+                        size: file.size,
+                        hash,
+                        content_type: target.content_type,
+                        object_path: target.object_path,
+                    });
+                }
+
+                updateSoftLoad("Saving build", "Writing manifest and metadata");
+                const completeResponse = await fetch(`${form.dataset.completeBase}/${uploadSession.build_id}/complete`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        ...formPayload(form),
+                        version: uploadSession.version,
+                        files: uploadedFiles,
+                    }),
+                });
+                if (!completeResponse.ok) {
+                    throw new Error(await completeResponse.text());
+                }
+
+                updateSoftLoad("Done", "Refreshing dashboard");
+                window.location.href = form.dataset.returnUrl;
+            } catch (error) {
+                clearInterval(softLoadTimer);
+                updateSoftLoad("Upload failed", error.message || "Please try again");
+                restoreForm(form);
+            }
+        }
+
+        document.querySelectorAll("form[data-direct-upload='true']").forEach((form) => {
+            form.addEventListener("submit", (event) => {
+                event.preventDefault();
+                uploadBuildToStorage(form);
+            });
+        });
+
         document.querySelectorAll("form[data-loading-steps]").forEach((form) => {
             form.addEventListener("submit", (event) => {
+                if (form.dataset.directUpload === "true") {
+                    return;
+                }
                 const message = form.dataset.confirm;
                 if (message && !confirm(message)) {
                     event.preventDefault();
