@@ -101,6 +101,15 @@
             gap: 8px;
         }
 
+        .account {
+            display: grid;
+            gap: 10px;
+            padding: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+        }
+
         .project-link {
             display: grid;
             grid-template-columns: 36px minmax(0, 1fr);
@@ -413,6 +422,11 @@
             min-width: 110px;
         }
 
+        .user-list {
+            display: grid;
+            gap: 8px;
+        }
+
         .alert {
             border: 1px solid #f0c56c;
             background: #fff8e8;
@@ -486,6 +500,16 @@
                 </div>
             </div>
 
+            <div class="account">
+                <div>
+                    <strong>{{ user.email }}</strong>
+                    <div class="tiny">role: {{ user.role }}</div>
+                </div>
+                <form method="post" action="{{ url_for('logout') }}">
+                    <button class="button secondary" type="submit">Logout</button>
+                </form>
+            </div>
+
             <div>
                 <div class="tiny">Projects</div>
                 <nav class="project-list" aria-label="Projects">
@@ -502,6 +526,7 @@
                 </nav>
             </div>
 
+            {% if user.role == "admin" %}
             <form class="form-grid" method="post" action="{{ url_for('create_project') }}">
                 <h3>Create Project</h3>
                 <label class="field">
@@ -526,6 +551,7 @@
                 </label>
                 <button class="button" type="submit">+ Project</button>
             </form>
+            {% endif %}
         </aside>
 
         <main class="main">
@@ -558,6 +584,7 @@
                         </div>
                     </div>
 
+                    {% if user.role == "admin" %}
                     <form class="form-grid" method="post" action="{{ url_for('update_project', project_id=selected_project.id) }}">
                         <label class="field">
                             <span class="label">Project name</span>
@@ -586,6 +613,7 @@
                         onsubmit="return confirm('Delete this project and all builds?');">
                         <button class="button danger" type="submit">Delete Project</button>
                     </form>
+                    {% endif %}
 
                     <div class="stats">
                         <div class="stat">
@@ -603,6 +631,7 @@
                     </div>
                 </div>
 
+                {% if user.role in ["admin", "dev"] %}
                 <div class="panel">
                     <h3>Build Upload</h3>
                     <form class="form-grid" method="post" enctype="multipart/form-data"
@@ -623,7 +652,9 @@
                                 <span class="label">Channel</span>
                                 <select name="channel">
                                     {% for channel in channels %}
+                                    {% if user.role == "admin" or (user.role == "dev" and channel != "live") %}
                                     <option value="{{ channel }}">{{ channel }}</option>
+                                    {% endif %}
                                     {% endfor %}
                                 </select>
                             </label>
@@ -647,7 +678,44 @@
                         <div class="flow-step"><b>Assign</b><span class="meta">dev / qa / live</span></div>
                     </div>
                 </div>
+                {% endif %}
             </section>
+
+            {% if user.role == "admin" %}
+            <section class="panel">
+                <h3>User Access</h3>
+                <form class="form-grid" method="post" action="{{ url_for('upsert_user') }}">
+                    <div class="form-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr));">
+                        <label class="field">
+                            <span class="label">Email</span>
+                            <input name="email" type="email" placeholder="teammate@example.com" required>
+                        </label>
+                        <label class="field">
+                            <span class="label">Password</span>
+                            <input name="password" type="password" placeholder="keep blank to preserve">
+                        </label>
+                        <label class="field">
+                            <span class="label">Role</span>
+                            <select name="role">
+                                {% for role in user_roles %}
+                                <option value="{{ role }}">{{ role }}</option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                    </div>
+                    <button class="button" type="submit">Save User</button>
+                </form>
+
+                <div class="user-list">
+                    {% for access_user in users %}
+                    <div class="stat">
+                        <strong>{{ access_user.email }}</strong>
+                        <span class="meta">role: {{ access_user.role }}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+            </section>
+            {% endif %}
 
             <section class="panel">
                 <div class="build-head">
@@ -699,19 +767,25 @@
                         <div class="code">{{ build.storage_path }} | {{ build.manifest_path }}</div>
 
                         <div class="split-actions">
+                            {% if user.role in ["admin", "dev", "QA"] %}
                             <form class="inline-form" method="post" action="{{ url_for('update_build_channel', build_id=build.id) }}">
                                 <select name="channel">
                                     {% for channel in channels %}
+                                    {% if user.role == "admin" or (user.role == "dev" and channel != "live") or (user.role == "QA" and channel == "qa") %}
                                     <option value="{{ channel }}" {% if build.channel == channel %}selected{% endif %}>{{ channel }}</option>
+                                    {% endif %}
                                     {% endfor %}
                                 </select>
-                                <button class="icon-button" type="submit" title="Assign channel">→</button>
+                                <button class="icon-button" type="submit" title="Assign channel">&rarr;</button>
                             </form>
+                            {% endif %}
                             <div class="actions">
                                 <a class="button secondary" href="{{ url_for('build_manifest', build_id=build.id) }}">Manifest</a>
+                                {% if user.role == "admin" %}
                                 <form method="post" action="{{ url_for('rollback_build', build_id=build.id) }}">
                                     <button class="button secondary" type="submit">Rollback</button>
                                 </form>
+                                {% endif %}
                             </div>
                         </div>
                     </article>
