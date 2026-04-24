@@ -361,17 +361,17 @@ def file_manifest_entry(path, content):
 
 
 def r2_bucket_name():
-    return os.getenv("CLOUDFLARE_R2_BUCKET", "").strip()
+    return (os.getenv("CLOUDFLARE_R2_BUCKET") or os.getenv("R2_BUCKET_NAME") or "").strip()
 
 
 def r2_public_base_url():
-    return os.getenv("CLOUDFLARE_R2_PUBLIC_URL", "").strip().rstrip("/")
+    return (os.getenv("CLOUDFLARE_R2_PUBLIC_URL") or os.getenv("R2_PUBLIC_URL") or "").strip().rstrip("/")
 
 
 def r2_client():
-    account_id = os.getenv("CLOUDFLARE_R2_ACCOUNT_ID", "").strip()
-    access_key = os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID", "").strip()
-    secret_key = os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", "").strip()
+    account_id = (os.getenv("CLOUDFLARE_R2_ACCOUNT_ID") or os.getenv("R2_ACCOUNT_ID") or "").strip()
+    access_key = (os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID") or "").strip()
+    secret_key = (os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY") or "").strip()
     if not account_id or not access_key or not secret_key or not r2_bucket_name():
         raise RuntimeError("Cloudflare R2 is not configured")
 
@@ -387,9 +387,9 @@ def r2_client():
 
 def r2_configured():
     return bool(
-        os.getenv("CLOUDFLARE_R2_ACCOUNT_ID", "").strip()
-        and os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID", "").strip()
-        and os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", "").strip()
+        (os.getenv("CLOUDFLARE_R2_ACCOUNT_ID") or os.getenv("R2_ACCOUNT_ID") or "").strip()
+        and (os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID") or "").strip()
+        and (os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY") or "").strip()
         and r2_bucket_name()
     )
 
@@ -413,6 +413,43 @@ def signed_upload_url(object_path, content_type):
         },
         ExpiresIn=1800,
     )
+
+
+def signed_download_url(object_path):
+    public_base_url = r2_public_base_url()
+    if public_base_url:
+        return f"{public_base_url}/{object_path.lstrip('/')}"
+
+    return r2_client().generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": r2_bucket_name(),
+            "Key": object_path,
+        },
+        ExpiresIn=3600,
+    )
+
+
+def dashboard_download_url(object_path):
+    if not object_path:
+        return ""
+    return url_for("download_r2_object", object_path=object_path, _external=True, _scheme="https")
+
+
+def manifest_with_download_urls(manifest):
+    manifest = dict(manifest or {})
+    files = []
+    for item in manifest.get("files", []):
+        entry = dict(item)
+        object_path = entry.get("storage_object") or entry.get("object_path")
+        if object_path:
+            download_url = dashboard_download_url(object_path)
+            entry["storage_object"] = object_path
+            entry["storage_url"] = download_url
+            entry["download_url"] = download_url
+        files.append(entry)
+    manifest["files"] = files
+    return manifest
 
 
 def manifest_from_uploads(uploads):
@@ -463,21 +500,24 @@ def manifest_from_uploads(uploads):
 def manifest_from_uploaded_files(files):
     entries = []
     for item in files:
+        object_path = item.get("object_path", "")
+        download_url = dashboard_download_url(object_path)
         entries.append(
             {
                 "path": item.get("name", "build.bin").replace("\\", "/"),
                 "hash": item.get("hash", ""),
                 "size": int(item.get("size", 0) or 0),
                 "content_type": item.get("content_type", "application/octet-stream"),
-                "storage_object": item.get("object_path", ""),
-                "storage_url": f"gs://{storage_bucket().name}/{item.get('object_path', '')}",
+                "storage_object": object_path,
+                "storage_url": download_url,
+                "download_url": download_url,
             }
         )
 
     total_size = sum(entry["size"] for entry in entries)
     return {
         "generated_at": now_iso(),
-        "source": "firebase-storage-upload",
+        "source": "cloudflare-r2-upload",
         "file_count": len(entries),
         "total_size": total_size,
         "files": entries,
@@ -539,8 +579,14 @@ def delete_project(project_id):
     if writes:
         batch.commit()
 
-    for blob in storage_bucket().list_blobs(prefix=f"builds/{project_id}/"):
-        blob.delete()
+    if r2_configured():
+        client = r2_client()
+        paginator = client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=r2_bucket_name(), Prefix=f"builds/{project_id}/")
+        for page in pages:
+            objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
+            if objects:
+                client.delete_objects(Bucket=r2_bucket_name(), Delete={"Objects": objects})
 
     return deleted_builds
 
@@ -691,7 +737,9 @@ def api_remove_project(project_id):
 @role_required("admin", "dev")
 def init_storage_upload(project_id):
     if db is None:
-        return jsonify({"error": "Firebase Storage is not configured"}), 503
+        return jsonify({"error": "Firestore is not configured"}), 503
+    if not r2_configured():
+        return jsonify({"error": "Cloudflare R2 is not configured"}), 503
     if not get_project(project_id):
         return jsonify({"error": "project not found"}), 404
 
@@ -726,7 +774,7 @@ def init_storage_upload(project_id):
         {
             "build_id": build_id,
             "version": version,
-            "bucket": storage_bucket().name,
+            "bucket": r2_bucket_name(),
             "expires_in_seconds": 1800,
             "uploads": uploads,
         }
@@ -737,7 +785,9 @@ def init_storage_upload(project_id):
 @role_required("admin", "dev")
 def complete_storage_upload(project_id, build_id):
     if db is None:
-        return jsonify({"error": "Firebase Storage is not configured"}), 503
+        return jsonify({"error": "Firestore is not configured"}), 503
+    if not r2_configured():
+        return jsonify({"error": "Cloudflare R2 is not configured"}), 503
     if not get_project(project_id):
         return jsonify({"error": "project not found"}), 404
 
@@ -789,6 +839,16 @@ def api_project_builds(project_id):
     return jsonify(list_builds(project_id))
 
 
+@app.route("/api/artifacts/<path:object_path>", methods=["GET"])
+@login_required
+def download_r2_object(object_path):
+    if not r2_configured():
+        return jsonify({"error": "Cloudflare R2 is not configured"}), 503
+    if not object_path.startswith("builds/"):
+        return jsonify({"error": "invalid object path"}), 400
+    return redirect(signed_download_url(object_path))
+
+
 @app.route("/builds/<build_id>/manifest", methods=["GET"])
 @app.route("/api/builds/<build_id>/manifest", methods=["GET"])
 @login_required
@@ -796,7 +856,8 @@ def build_manifest(build_id):
     build = get_build(build_id)
     if not build:
         return jsonify({"error": "build not found"}), 404
-    return jsonify(build.get("manifest", {"files": [], "file_count": build.get("file_count", 0)}))
+    manifest = build.get("manifest", {"files": [], "file_count": build.get("file_count", 0)})
+    return jsonify(manifest_with_download_urls(manifest))
 
 
 @app.route("/builds/<build_id>/channel", methods=["POST", "PATCH"])
