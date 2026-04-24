@@ -188,6 +188,11 @@
             border: 1px solid var(--line);
         }
 
+        .button.danger {
+            background: var(--rose);
+            color: #fff;
+        }
+
         .icon-button {
             width: 40px;
             padding: 0;
@@ -575,6 +580,11 @@
                             </select>
                         </label>
                         <button class="button" type="submit">Save Project</button>
+                    </form>
+
+                    <form method="post" action="{{ url_for('remove_project', project_id=selected_project.id) }}"
+                        onsubmit="return confirm('Delete this project and all builds?');">
+                        <button class="button danger" type="submit">Delete Project</button>
                     </form>
 
                     <div class="stats">

@@ -265,6 +265,34 @@ def save_project(data, project_id=None):
     return document.id, project
 
 
+def delete_project(project_id):
+    if db is None:
+        global demo_projects
+        demo_projects = [project for project in demo_projects if project["id"] != project_id]
+        demo_builds.pop(project_id, None)
+        return 0
+
+    deleted_builds = 0
+    batch = db.batch()
+    writes = 0
+
+    for build in db.collection("builds").where("project_id", "==", project_id).stream():
+        batch.delete(build.reference)
+        deleted_builds += 1
+        writes += 1
+        if writes == 499:
+            batch.commit()
+            batch = db.batch()
+            writes = 0
+
+    batch.delete(db.collection("projects").document(project_id))
+    writes += 1
+    if writes:
+        batch.commit()
+
+    return deleted_builds
+
+
 def save_build(project_id, form, uploads):
     build_id = f"build-{uuid.uuid4().hex[:12]}"
     version = next_version(project_id, form.get("version", "").strip())
@@ -334,6 +362,20 @@ def create_project():
 def update_project(project_id):
     save_project(request.form, project_id)
     return redirect(url_for("index", project=project_id))
+
+
+@app.route("/projects/<project_id>/delete", methods=["POST"])
+@app.route("/api/projects/<project_id>", methods=["DELETE"])
+def remove_project(project_id):
+    project = get_project(project_id)
+    if not project:
+        response = {"error": "project not found"}
+        return (jsonify(response), 404) if wants_json() else redirect(url_for("index"))
+
+    deleted_builds = delete_project(project_id)
+    if wants_json():
+        return jsonify({"id": project_id, "deleted_builds": deleted_builds})
+    return redirect(url_for("index"))
 
 
 @app.route("/projects/<project_id>/builds", methods=["POST"])
