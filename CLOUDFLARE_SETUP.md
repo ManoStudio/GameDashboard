@@ -69,6 +69,8 @@ R2_ACCOUNT_ID = "4956abaf4d499cde396a8c7ebf6061c6"
 npx wrangler d1 migrations apply game-dashboard-db --remote
 ```
 
+The Worker also runs `CREATE TABLE IF NOT EXISTS` on startup as a safety net, but applying migrations is still recommended so the database is ready before traffic arrives.
+
 For local development:
 
 ```bash
