@@ -1,9 +1,9 @@
 [
   {
-    "AllowedOrigins": ["https://game-dashboard.mano-game.workers.dev", "https://<your-custom-domain>", "http://localhost:8787"],
+    "AllowedOrigins": ["*"],
     "AllowedMethods": ["PUT", "GET", "HEAD"],
-    "AllowedHeaders": ["content-type"],
-    "ExposeHeaders": ["etag"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
     "MaxAgeSeconds": 3600
   }
 ]

@@ -95,7 +95,11 @@ npx wrangler d1 migrations apply game-dashboard-db --local
 
 In Cloudflare Dashboard -> R2 -> bucket -> Settings -> CORS policy, use `r2-cors.json`.
 
-Replace the placeholder origin with your real Worker domain.
+The included `r2-cors.json` uses `"AllowedOrigins": ["*"]` and `"AllowedHeaders": ["*"]` so signed upload URLs work reliably from the dashboard.
+
+Because uploads still require short-lived signed URLs, this is acceptable for getting the build pipeline working. You can tighten it later to your exact Worker/custom domain.
+
+If you tighten it, replace the origin with your real Worker domain.
 
 For example, if your dashboard URL is:
 
