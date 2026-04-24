@@ -80,6 +80,7 @@ async function dispatch(request, env, url, user) {
   if (path === "/api/auth/logout" && method === "POST") return logoutJson(request, env);
   if (path === "/api/me" && method === "GET") return requireLogin(user, true) || json({ user: describeUser(user) });
   if (path === "/api/launcher/latest" && method === "GET") return launcherLatest(request, env);
+  if (path === "/api/launcher/history" && method === "GET") return launcherHistory(request, env);
   if (path === "/" && method === "GET") return requireLogin(user) || dashboard(request, env, user);
 
   if (path === "/projects" && method === "POST") return requireRole(user, "admin") || createProject(request, env);
@@ -487,20 +488,125 @@ async function launcherLatest(request, env) {
 
   const build = await rowToBuild(env, row, url.origin);
   const files = build?.manifest?.files || [];
-  const artifact =
-    files.find(file => /\.(exe|msi|zip|dmg|pkg|appimage)$/i.test(String(file.path || ""))) ||
-    files[0] ||
-    null;
-  const downloadUrl = artifact?.download_url || artifact?.storage_url || "";
+  const { full, patches } = launcherArtifacts(files, build.version);
+  const matchingPatch = currentVersion
+    ? patches.find(item => item.from_version === currentVersion && item.to_version === build.version)
+    : null;
+  const fullUrl = full?.download_url || full?.storage_url || "";
+  const patchUrl = matchingPatch?.patch_url || "";
   const hasUpdate = currentVersion ? compareVersions(build.version, currentVersion) > 0 : true;
+  const mandatoryTag = String(build.tag || "").toLowerCase();
+  const isMandatory = mandatoryTag.includes("force") || mandatoryTag.includes("mandatory");
 
   return json({
     has_update: hasUpdate,
-    is_mandatory: false,
+    is_mandatory: isMandatory,
     version: build.version,
-    download_url: downloadUrl,
+    from_version: matchingPatch?.from_version || "",
+    patch_url: hasUpdate ? patchUrl : "",
+    full_url: fullUrl,
+    download_url: hasUpdate ? (patchUrl || fullUrl) : "",
     notes: build.changelog || "No release notes.",
+    channel,
+    release: {
+      version: build.version,
+      is_mandatory: isMandatory,
+      notes: build.changelog || "No release notes.",
+      full_url: fullUrl,
+      full_hash: full?.hash || "",
+      full_size: Number(full?.size || 0),
+      patches,
+    },
   });
+}
+
+async function launcherHistory(request, env) {
+  const url = new URL(request.url);
+  const channel = CHANNELS.includes(url.searchParams.get("channel")) ? url.searchParams.get("channel") : "live";
+  const projectId = url.searchParams.get("project_id") || env.LAUNCHER_PROJECT_ID || "";
+  const bundleId = url.searchParams.get("bundle_id") || env.LAUNCHER_BUNDLE_ID || "";
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 20), 1), 100);
+  let query = "";
+  let params = [];
+
+  if (projectId) {
+    query = "SELECT * FROM builds WHERE project_id = ? AND channel = ? ORDER BY created_at DESC LIMIT ?";
+    params = [projectId, channel, limit];
+  } else if (bundleId) {
+    query = "SELECT builds.* FROM builds JOIN projects ON projects.id = builds.project_id WHERE projects.bundle_id = ? AND builds.channel = ? ORDER BY builds.created_at DESC LIMIT ?";
+    params = [bundleId, channel, limit];
+  } else {
+    query = "SELECT * FROM builds WHERE channel = ? ORDER BY created_at DESC LIMIT ?";
+    params = [channel, limit];
+  }
+
+  const { results } = await env.DB.prepare(query).bind(...params).all();
+  const releases = await Promise.all((results || []).map(async row => {
+    const build = await rowToBuild(env, row, url.origin);
+    const { full, patches } = launcherArtifacts(build?.manifest?.files || [], build.version);
+    const mandatoryTag = String(build.tag || "").toLowerCase();
+    return {
+      build_id: build.id,
+      project_id: build.project_id,
+      version: build.version,
+      created_at: build.created_at,
+      is_mandatory: mandatoryTag.includes("force") || mandatoryTag.includes("mandatory"),
+      notes: build.changelog || "No release notes.",
+      full_url: full?.download_url || full?.storage_url || "",
+      full_hash: full?.hash || "",
+      full_size: Number(full?.size || 0),
+      patches,
+    };
+  }));
+
+  return json({ channel, releases });
+}
+
+function launcherArtifacts(files, latestVersion) {
+  const list = Array.isArray(files) ? files : [];
+  const fullCandidates = list.filter(file => isLauncherFullArtifact(file.path));
+  const full = fullCandidates.find(file => isTrustedIntegrity(file)) || fullCandidates[0] || list[0] || null;
+  const patches = list
+    .filter(file => isPatchArtifact(file.path))
+    .map(file => {
+      const parsed = parsePatchVersions(file.path, latestVersion);
+      if (!parsed) return null;
+      if (!isTrustedIntegrity(file)) return null;
+      return {
+        from_version: parsed.from_version,
+        to_version: parsed.to_version,
+        patch_url: file.download_url || file.storage_url || "",
+        hash: file.hash || "",
+        size: Number(file.size || 0),
+      };
+    })
+    .filter(Boolean);
+  return { full, patches };
+}
+
+function isLauncherFullArtifact(path) {
+  const text = String(path || "").toLowerCase();
+  const fullExt = /\.(exe|msi|zip|dmg|pkg|appimage)$/;
+  return fullExt.test(text) && (text.includes("full") || text.includes("setup") || text.includes("installer") || !text.includes("patch"));
+}
+
+function isPatchArtifact(path) {
+  const text = String(path || "").toLowerCase();
+  return text.includes("patch") || /\.patch(\.|$)/.test(text) || /\.delta(\.|$)/.test(text);
+}
+
+function parsePatchVersions(path, latestVersion) {
+  const text = String(path || "").toLowerCase();
+  const explicit = text.match(/(?:from[-_v]*)?(\d+\.\d+\.\d+)[-_.]*(?:to|->)[-_v]*(\d+\.\d+\.\d+)/i);
+  if (explicit) return { from_version: explicit[1], to_version: explicit[2] };
+  const single = text.match(/patch[-_v]*(\d+\.\d+\.\d+)/i);
+  if (single) return { from_version: single[1], to_version: latestVersion };
+  return null;
+}
+
+function isTrustedIntegrity(file) {
+  const hash = String(file?.hash || "").trim();
+  return hash.length >= 32;
 }
 
 function compareVersions(left, right) {
