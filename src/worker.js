@@ -76,6 +76,9 @@ async function dispatch(request, env, url, user) {
   if (path === "/login" && method === "GET") return loginPage();
   if (path === "/login" && method === "POST") return login(request, env);
   if (path === "/logout" && method === "POST") return logout(request, env);
+  if (path === "/api/auth/login" && method === "POST") return loginJson(request, env);
+  if (path === "/api/auth/logout" && method === "POST") return logoutJson(request, env);
+  if (path === "/api/me" && method === "GET") return requireLogin(user, true) || json({ user: describeUser(user) });
   if (path === "/" && method === "GET") return requireLogin(user) || dashboard(request, env, user);
 
   if (path === "/projects" && method === "POST") return requireRole(user, "admin") || createProject(request, env);
@@ -138,6 +141,16 @@ async function currentUser(request, env) {
   return session ? { email: session.email, role: session.role } : null;
 }
 
+function describeUser(user) {
+  if (!user) return null;
+  return {
+    email: user.email,
+    role: user.role,
+    visible_channels: visibleChannelsForRole(user.role),
+    runtime_environments: runtimeEnvironmentsForRole(user.role),
+  };
+}
+
 function apiTokenUser(request, env) {
   const expected = env.DASHBOARD_API_TOKEN;
   const header = request.headers.get("Authorization") || "";
@@ -159,62 +172,65 @@ function requireRole(user, ...rolesAndMaybeJson) {
 }
 
 async function login(request, env) {
-  const form = await request.formData();
-  const email = String(form.get("email") || "").trim().toLowerCase();
-  const password = String(form.get("password") || "");
-  const user = await env.DB.prepare("SELECT email, password_hash FROM users WHERE email = ?").bind(email).first();
-  if (!user || !(await verifyPassword(password, user.password_hash))) return loginPage("Invalid email or password");
-  const token = crypto.randomUUID() + crypto.randomUUID();
-  const now = new Date();
-  const expires = new Date(now.getTime() + 7 * 86400 * 1000);
-  await env.DB.prepare("INSERT INTO sessions (token_hash, email, expires_at, created_at) VALUES (?, ?, ?, ?)")
-    .bind(await sha256Hex(token), email, expires.toISOString(), now.toISOString())
-    .run();
-  return redirect("/", { "Set-Cookie": `sid=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800` });
+  const session = await createSession(request, env);
+  if (!session.ok) return loginPage(session.error);
+  return redirect("/", { "Set-Cookie": session.cookie });
 }
 
 async function logout(request, env) {
-  const token = cookie(request, "sid");
-  if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256Hex(token)).run();
-  return redirect("/login", { "Set-Cookie": "sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" });
+  await clearSession(request, env);
+  return redirect("/login", { "Set-Cookie": expiredSessionCookie() });
+}
+
+async function loginJson(request, env) {
+  const session = await createSession(request, env);
+  if (!session.ok) return json({ error: session.error }, 401);
+  return json({ user: describeUser(session.user) }, 200, { "Set-Cookie": session.cookie });
+}
+
+async function logoutJson(request, env) {
+  await clearSession(request, env);
+  return json({ ok: true }, 200, { "Set-Cookie": expiredSessionCookie() });
 }
 
 async function dashboard(request, env, user) {
   const url = new URL(request.url);
   const projects = await listProjects(env, user);
   const selectedId = url.searchParams.get("project") || projects[0]?.id || null;
-  const selected = selectedId ? await getProject(env, selectedId) : null;
+  const selected = selectedId ? await getProject(env, selectedId, user) : null;
   const builds = selected ? await listBuilds(env, selected.id, user) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
   return html(renderDashboard({ user, projects, selected, builds, users }));
 }
 
 async function listProjects(env, user = null) {
-  if (!user) {
-    const { results } = await env.DB.prepare(
-      `SELECT projects.* FROM projects
-       WHERE EXISTS (
-         SELECT 1 FROM builds
-         WHERE builds.project_id = projects.id AND builds.channel = 'live'
-       )
-       ORDER BY projects.created_at DESC`
-    ).all();
-    return results || [];
-  }
   const { results } = await env.DB.prepare("SELECT * FROM projects ORDER BY created_at DESC").all();
-  return results || [];
+  const projects = results || [];
+  const visibleProjects = [];
+  for (const project of projects) {
+    if (!canAccessProject(user, project)) continue;
+    if (!user) {
+      const liveBuild = await env.DB.prepare(
+        "SELECT 1 FROM builds WHERE project_id = ? AND channel = 'live' LIMIT 1"
+      ).bind(project.id).first();
+      if (!liveBuild) continue;
+    }
+    visibleProjects.push(project);
+  }
+  return visibleProjects;
 }
 
-async function getProject(env, id) {
-  return env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
+async function getProject(env, id, user = null) {
+  const project = await env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
+  return canAccessProject(user, project) ? project : null;
 }
 
 async function listBuilds(env, projectId, user = null) {
-  const statement = user
-    ? "SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC"
-    : "SELECT * FROM builds WHERE project_id = ? AND channel = 'live' ORDER BY created_at DESC";
-  const { results } = await env.DB.prepare(statement).bind(projectId).all();
-  return (results || []).map(rowToBuild);
+  const project = await getProject(env, projectId, user);
+  if (!project) return [];
+  const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
+  const visibleChannels = new Set(visibleChannelsForRole(user?.role));
+  return (results || []).filter(row => visibleChannels.has(row.channel)).map(rowToBuild);
 }
 
 async function listUsers(env) {
@@ -228,14 +244,14 @@ async function createProject(request, env) {
   const now = nowIso();
   await env.DB.prepare(
     "INSERT INTO projects (id, name, icon, bundle_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).bind(id, field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "dev", now, now).run();
+  ).bind(id, field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "viewer", now, now).run();
   return redirect(`/?project=${id}`);
 }
 
 async function updateProject(request, env, id) {
   const form = await request.formData();
   await env.DB.prepare("UPDATE projects SET name = ?, icon = ?, bundle_id = ?, role = ?, updated_at = ? WHERE id = ?")
-    .bind(field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "dev", nowIso(), id)
+    .bind(field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "viewer", nowIso(), id)
     .run();
   return redirect(`/?project=${id}`);
 }
@@ -399,11 +415,10 @@ async function rollbackBuild(env, buildId) {
 }
 
 async function buildManifest(env, buildId, user = null) {
-  const statement = user
-    ? "SELECT manifest_json FROM builds WHERE id = ?"
-    : "SELECT manifest_json FROM builds WHERE id = ? AND channel = 'live'";
-  const build = await env.DB.prepare(statement).bind(buildId).first();
+  const build = await env.DB.prepare("SELECT manifest_json, project_id, channel FROM builds WHERE id = ?").bind(buildId).first();
   if (!build) return json({ error: "build not found" }, 404);
+  const project = await getProject(env, build.project_id, user);
+  if (!project || !visibleChannelsForRole(user?.role).includes(build.channel)) return json({ error: "build not found" }, 404);
   return json(JSON.parse(build.manifest_json));
 }
 
@@ -416,6 +431,32 @@ async function nextVersion(env, projectId) {
 
 function rowToBuild(row) {
   return row ? { ...row, manifest: row.manifest_json ? JSON.parse(row.manifest_json) : null } : null;
+}
+
+function roleRank(role) {
+  return {
+    viewer: 0,
+    QA: 1,
+    dev: 2,
+    admin: 3,
+  }[role] ?? -1;
+}
+
+function canAccessProject(user, project) {
+  if (!project) return false;
+  const requiredRole = project.role || "viewer";
+  const effectiveRole = user?.role || "viewer";
+  return roleRank(effectiveRole) >= roleRank(requiredRole);
+}
+
+function visibleChannelsForRole(role) {
+  if (role === "admin" || role === "dev") return ["dev", "qa", "live"];
+  if (role === "QA") return ["qa", "live"];
+  return ["live"];
+}
+
+function runtimeEnvironmentsForRole(role) {
+  return role === "viewer" || !role ? ["production"] : ["dev", "staging", "production"];
 }
 
 function canAssign(role, channel) {
@@ -516,6 +557,40 @@ function field(form, name) {
   return String(form.get(name) || "").trim();
 }
 
+async function createSession(request, env) {
+  const payload = request.headers.get("content-type")?.includes("application/json")
+    ? await request.json()
+    : Object.fromEntries(await request.formData());
+  const email = String(payload.email || "").trim().toLowerCase();
+  const password = String(payload.password || "");
+  const user = await env.DB.prepare("SELECT email, role, password_hash FROM users WHERE email = ?").bind(email).first();
+  if (!user || !(await verifyPassword(password, user.password_hash))) {
+    return { ok: false, error: "Invalid email or password" };
+  }
+  const token = crypto.randomUUID() + crypto.randomUUID();
+  const now = new Date();
+  const expires = new Date(now.getTime() + 7 * 86400 * 1000);
+  await env.DB.prepare("INSERT INTO sessions (token_hash, email, expires_at, created_at) VALUES (?, ?, ?, ?)")
+    .bind(await sha256Hex(token), email, expires.toISOString(), now.toISOString())
+    .run();
+  return {
+    ok: true,
+    user: { email: user.email, role: user.role },
+    cookie: `sid=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`,
+  };
+}
+
+async function clearSession(request, env) {
+  const token = cookie(request, "sid");
+  if (token) {
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256Hex(token)).run();
+  }
+}
+
+function expiredSessionCookie() {
+  return "sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+}
+
 function cookie(request, name) {
   return Object.fromEntries((request.headers.get("Cookie") || "").split(";").map(part => {
     const [key, ...value] = part.trim().split("=");
@@ -531,8 +606,8 @@ function redirect(location, headers = {}) {
   return new Response(null, { status: 302, headers: { Location: location, ...headers } });
 }
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...headers } });
 }
 
 function html(body, status = 200) {
@@ -561,7 +636,7 @@ function renderDashboard({ user, projects, selected, builds, users }) {
 }
 
 function createProjectForm() {
-  return `<form class="form-grid" method="post" action="/projects" data-loading-steps="Creating project|Saving project data|Refreshing dashboard"><h3>Create Project</h3><label class="field"><span class="label">Project name</span><input name="name" required></label><label class="field"><span class="label">Icon</span><input name="icon" maxlength="4" placeholder="GM"></label><label class="field"><span class="label">Bundle ID</span><input name="bundle_id" required></label><label class="field"><span class="label">Role</span><select name="role">${["admin", "dev", "QA"].map(role => `<option>${role}</option>`).join("")}</select></label><button class="button">+ Project</button></form>`;
+  return `<form class="form-grid" method="post" action="/projects" data-loading-steps="Creating project|Saving project data|Refreshing dashboard"><h3>Create Project</h3><label class="field"><span class="label">Project name</span><input name="name" required></label><label class="field"><span class="label">Icon</span><input name="icon" maxlength="4" placeholder="GM"></label><label class="field"><span class="label">Bundle ID</span><input name="bundle_id" required></label><label class="field"><span class="label">Role</span><select name="role">${["viewer", "QA", "dev", "admin"].map(role => `<option>${role}</option>`).join("")}</select></label><button class="button">+ Project</button></form>`;
 }
 
 function projectView(user, project, builds, latest, users) {
@@ -569,7 +644,7 @@ function projectView(user, project, builds, latest, users) {
 }
 
 function projectManagement(user, project, builds, latest) {
-  return `<div class="summary"><div class="project-icon">${escapeHtml(project.icon.slice(0, 2).toUpperCase())}</div><div><h3>Project Management</h3><p>role: ${escapeHtml(project.role)}</p></div></div>${user.role === "admin" ? `<form class="form-grid" method="post" action="/projects/${project.id}" data-loading-steps="Saving project|Updating D1|Refreshing dashboard"><label class="field"><span class="label">Project name</span><input name="name" value="${escapeHtml(project.name)}" required></label><label class="field"><span class="label">Icon</span><input name="icon" value="${escapeHtml(project.icon)}" maxlength="4"></label><label class="field"><span class="label">Bundle ID</span><input name="bundle_id" value="${escapeHtml(project.bundle_id)}" required></label><label class="field"><span class="label">Access role</span><select name="role">${["admin", "dev", "QA"].map(role => `<option ${project.role === role ? "selected" : ""}>${role}</option>`).join("")}</select></label><button class="button">Save Project</button></form><form method="post" action="/projects/${project.id}/delete" data-confirm="Delete this project and all builds?" data-loading-steps="Deleting R2 files|Removing project|Refreshing dashboard"><button class="button danger">Delete Project</button></form>` : ""}<div class="stats"><div class="stat"><strong>${builds.length}</strong><span>builds</span></div><div class="stat"><strong>${latest?.channel || "-"}</strong><span>latest channel</span></div><div class="stat"><strong>${latest?.version || "-"}</strong><span>version</span></div></div>`;
+  return `<div class="summary"><div class="project-icon">${escapeHtml(project.icon.slice(0, 2).toUpperCase())}</div><div><h3>Project Management</h3><p>role: ${escapeHtml(project.role)}</p></div></div>${user.role === "admin" ? `<form class="form-grid" method="post" action="/projects/${project.id}" data-loading-steps="Saving project|Updating D1|Refreshing dashboard"><label class="field"><span class="label">Project name</span><input name="name" value="${escapeHtml(project.name)}" required></label><label class="field"><span class="label">Icon</span><input name="icon" value="${escapeHtml(project.icon)}" maxlength="4"></label><label class="field"><span class="label">Bundle ID</span><input name="bundle_id" value="${escapeHtml(project.bundle_id)}" required></label><label class="field"><span class="label">Access role</span><select name="role">${["viewer", "QA", "dev", "admin"].map(role => `<option ${project.role === role ? "selected" : ""}>${role}</option>`).join("")}</select></label><button class="button">Save Project</button></form><form method="post" action="/projects/${project.id}/delete" data-confirm="Delete this project and all builds?" data-loading-steps="Deleting R2 files|Removing project|Refreshing dashboard"><button class="button danger">Delete Project</button></form>` : ""}<div class="stats"><div class="stat"><strong>${builds.length}</strong><span>builds</span></div><div class="stat"><strong>${latest?.channel || "-"}</strong><span>latest channel</span></div><div class="stat"><strong>${latest?.version || "-"}</strong><span>version</span></div></div>`;
 }
 
 function uploadPanel(user, project) {
@@ -582,10 +657,10 @@ function userAccess(users, currentUser) {
 
 function permissionMatrix() {
   const rows = [
-    ["admin", "Projects, users, uploads, live, rollback, delete"],
-    ["dev", "Upload builds, assign dev/qa"],
-    ["QA", "Review builds, assign qa"],
-    ["viewer", "Read-only dashboard and manifests"],
+    ["admin", "All dev tools plus users, project access, rollback, delete"],
+    ["dev", "Upload builds, view dev/qa/live, play every environment"],
+    ["QA", "View qa/live, play every environment, open and upload logs"],
+    ["viewer", "Live builds only, production runtime only"],
   ];
   return `<div class="permission-grid">${rows.map(([role, text]) => `<div class="stat"><strong>${role}</strong><span>${text}</span></div>`).join("")}</div>`;
 }
