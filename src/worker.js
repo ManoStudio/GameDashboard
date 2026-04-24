@@ -97,7 +97,7 @@ async function dispatch(request, env, url, user) {
 
   if (path === "/api/projects" && method === "GET") return json(await listProjects(env, user));
   const apiBuilds = path.match(/^\/api\/projects\/([^/]+)\/builds$/);
-  if (apiBuilds && method === "GET") return json(await listBuilds(env, apiBuilds[1], user));
+  if (apiBuilds && method === "GET") return json(await listBuilds(env, apiBuilds[1], user, url.origin));
   if (apiBuilds && method === "POST") return requireRole(user, "admin", "dev", true) || legacyTooLargeResponse();
 
   const apiDelete = path.match(/^\/api\/projects\/([^/]+)$/);
@@ -108,8 +108,11 @@ async function dispatch(request, env, url, user) {
   const completeUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/([^/]+)\/complete$/);
   if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2]);
 
+  const artifact = path.match(/^\/api\/artifacts\/(.+)$/);
+  if (artifact && method === "GET") return downloadArtifact(request, env, user, decodeURIComponent(artifact[1]));
+
   const manifest = path.match(/^\/builds\/([^/]+)\/manifest$/) || path.match(/^\/api\/builds\/([^/]+)\/manifest$/);
-  if (manifest && method === "GET") return buildManifest(env, manifest[1], user);
+  if (manifest && method === "GET") return buildManifest(request, env, manifest[1], user);
   const channel = path.match(/^\/builds\/([^/]+)\/channel$/) || path.match(/^\/api\/builds\/([^/]+)\/channel$/);
   if (channel && (method === "POST" || method === "PATCH")) return requireRole(user, "admin", "dev", "QA", true) || updateBuildChannel(request, env, user, channel[1]);
   const rollback = path.match(/^\/builds\/([^/]+)\/rollback$/);
@@ -198,7 +201,7 @@ async function dashboard(request, env, user) {
   const projects = await listProjects(env, user);
   const selectedId = url.searchParams.get("project") || projects[0]?.id || null;
   const selected = selectedId ? await getProject(env, selectedId, user) : null;
-  const builds = selected ? await listBuilds(env, selected.id, user) : [];
+  const builds = selected ? await listBuilds(env, selected.id, user, url.origin) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
   return html(renderDashboard({ user, projects, selected, builds, users }));
 }
@@ -225,12 +228,12 @@ async function getProject(env, id, user = null) {
   return canAccessProject(user, project) ? project : null;
 }
 
-async function listBuilds(env, projectId, user = null) {
+async function listBuilds(env, projectId, user = null, baseUrl = "") {
   const project = await getProject(env, projectId, user);
   if (!project) return [];
   const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
   const visibleChannels = new Set(visibleChannelsForRole(user?.role));
-  return Promise.all((results || []).filter(row => visibleChannels.has(row.channel)).map(row => rowToBuild(env, row)));
+  return Promise.all((results || []).filter(row => visibleChannels.has(row.channel)).map(row => rowToBuild(env, row, baseUrl)));
 }
 
 async function listUsers(env) {
@@ -348,6 +351,7 @@ async function initUploadSession(request, env, user, projectId) {
 }
 
 async function completeUploadSession(request, env, user, projectId, buildId) {
+  const baseUrl = new URL(request.url).origin;
   const payload = await request.json();
   const channel = payload.channel || "dev";
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
@@ -355,7 +359,7 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
   const files = payload.files || [];
   if (!files.length) return json({ error: "files are required" }, 400);
   const manifestFiles = await Promise.all(files.map(async file => {
-    const downloadUrl = await objectDownloadUrl(env, file.object_path);
+    const downloadUrl = await objectDownloadUrl(env, file.object_path, baseUrl);
     return {
       path: file.name || "build.bin",
       hash: file.hash || "",
@@ -373,11 +377,11 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
     total_size: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
     files: manifestFiles,
   };
-  const build = await saveBuild(env, projectId, buildId, payload, manifest);
+  const build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl);
   return json(build, 201);
 }
 
-async function saveBuild(env, projectId, buildId, payload, manifest) {
+async function saveBuild(env, projectId, buildId, payload, manifest, baseUrl = "") {
   const now = nowIso();
   const version = payload.version || await nextVersion(env, projectId);
   const channel = CHANNELS.includes(payload.channel) ? payload.channel : "dev";
@@ -398,7 +402,7 @@ async function saveBuild(env, projectId, buildId, payload, manifest) {
     now,
     now
   ).run();
-  return rowToBuild(env, await env.DB.prepare("SELECT * FROM builds WHERE id = ?").bind(buildId).first());
+  return rowToBuild(env, await env.DB.prepare("SELECT * FROM builds WHERE id = ?").bind(buildId).first(), baseUrl);
 }
 
 async function updateBuildChannel(request, env, user, buildId) {
@@ -419,12 +423,37 @@ async function rollbackBuild(env, buildId) {
   return redirect(`/?project=${build?.project_id || ""}`);
 }
 
-async function buildManifest(env, buildId, user = null) {
+async function buildManifest(request, env, buildId, user = null) {
   const build = await env.DB.prepare("SELECT manifest_json, project_id, channel FROM builds WHERE id = ?").bind(buildId).first();
   if (!build) return json({ error: "build not found" }, 404);
   const project = await getProject(env, build.project_id, user);
   if (!project || !visibleChannelsForRole(user?.role).includes(build.channel)) return json({ error: "build not found" }, 404);
-  return json(await manifestWithDownloadUrls(env, JSON.parse(build.manifest_json)));
+  return json(await manifestWithDownloadUrls(env, JSON.parse(build.manifest_json), new URL(request.url).origin));
+}
+
+async function downloadArtifact(request, env, user, key) {
+  if (!key.startsWith("builds/")) return json({ error: "invalid object path" }, 400);
+  const url = new URL(request.url);
+  const signed = await validArtifactSignature(env, key, url.searchParams);
+  if (!user && !signed) return json({ error: "unauthorized" }, 401);
+
+  const object = await env.BUILDS_BUCKET.get(key);
+  if (!object) return json({ error: "artifact not found" }, 404);
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("ETag", object.httpEtag);
+  headers.set("Cache-Control", "private, max-age=300");
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/octet-stream");
+  return new Response(object.body, { headers });
+}
+
+async function validArtifactSignature(env, key, params) {
+  const expires = Number(params.get("expires") || 0);
+  const signature = params.get("signature") || "";
+  if (!expires || !signature || expires < Math.floor(Date.now() / 1000)) return false;
+  const expected = await hmacHex(encoder.encode(env.R2_SECRET_ACCESS_KEY), `${key}.${expires}`);
+  return signature === expected;
 }
 
 async function nextVersion(env, projectId) {
@@ -434,11 +463,11 @@ async function nextVersion(env, projectId) {
   return parts.length === 3 && parts.every(Number.isInteger) ? `${parts[0]}.${parts[1]}.${parts[2] + 1}` : `${latest.version}.1`;
 }
 
-async function rowToBuild(env, row) {
+async function rowToBuild(env, row, baseUrl = "") {
   if (!row) return null;
   return {
     ...row,
-    manifest: row.manifest_json ? await manifestWithDownloadUrls(env, JSON.parse(row.manifest_json)) : null,
+    manifest: row.manifest_json ? await manifestWithDownloadUrls(env, JSON.parse(row.manifest_json), baseUrl) : null,
   };
 }
 
@@ -520,13 +549,13 @@ function r2Path(env, key) {
   return `/${env.R2_BUCKET_NAME}/${encodeURIComponent(key).replaceAll("%2F", "/")}`;
 }
 
-async function manifestWithDownloadUrls(env, manifest) {
+async function manifestWithDownloadUrls(env, manifest, baseUrl = "") {
   const updated = { ...(manifest || {}) };
   updated.files = await Promise.all((updated.files || []).map(async file => {
     const entry = { ...file };
     const key = entry.storage_object || entry.object_path;
     if (key) {
-      const downloadUrl = await objectDownloadUrl(env, key);
+      const downloadUrl = await objectDownloadUrl(env, key, baseUrl);
       entry.storage_object = key;
       entry.storage_url = downloadUrl;
       entry.download_url = downloadUrl;
@@ -536,9 +565,22 @@ async function manifestWithDownloadUrls(env, manifest) {
   return updated;
 }
 
-async function objectDownloadUrl(env, key) {
+async function objectDownloadUrl(env, key, baseUrl = "") {
+  const dashboardBase = (env.DASHBOARD_PUBLIC_URL || baseUrl || "").replace(/\/$/, "");
+  if (dashboardBase) return `${dashboardBase}/api/artifacts/${encodeObjectPath(key)}?${await artifactSignatureParams(env, key)}`;
+
   const base = (env.R2_PUBLIC_URL || "").replace(/\/$/, "");
   return base ? `${base}/${key}` : presignGet(env, key);
+}
+
+function encodeObjectPath(key) {
+  return String(key || "").split("/").map(part => encodeURIComponent(part)).join("/");
+}
+
+async function artifactSignatureParams(env, key) {
+  const expires = Math.floor(Date.now() / 1000) + 3600;
+  const signature = await hmacHex(encoder.encode(env.R2_SECRET_ACCESS_KEY), `${key}.${expires}`);
+  return new URLSearchParams({ expires: String(expires), signature }).toString();
 }
 
 async function signatureKey(secret, dateStamp, region, service) {
