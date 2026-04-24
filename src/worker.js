@@ -79,6 +79,7 @@ async function dispatch(request, env, url, user) {
   if (path === "/api/auth/login" && method === "POST") return loginJson(request, env);
   if (path === "/api/auth/logout" && method === "POST") return logoutJson(request, env);
   if (path === "/api/me" && method === "GET") return requireLogin(user, true) || json({ user: describeUser(user) });
+  if (path === "/api/launcher/latest" && method === "GET") return launcherLatest(request, env);
   if (path === "/" && method === "GET") return requireLogin(user) || dashboard(request, env, user);
 
   if (path === "/projects" && method === "POST") return requireRole(user, "admin") || createProject(request, env);
@@ -453,6 +454,64 @@ async function buildManifest(request, env, buildId, user = null) {
   const project = await getProject(env, build.project_id, user);
   if (!project || !visibleChannelsForRole(user?.role).includes(build.channel)) return json({ error: "build not found" }, 404);
   return json(await manifestWithDownloadUrls(env, JSON.parse(build.manifest_json), new URL(request.url).origin));
+}
+
+async function launcherLatest(request, env) {
+  const url = new URL(request.url);
+  const channel = CHANNELS.includes(url.searchParams.get("channel")) ? url.searchParams.get("channel") : "live";
+  const currentVersion = String(url.searchParams.get("current_version") || "").trim();
+  const projectId = url.searchParams.get("project_id") || env.LAUNCHER_PROJECT_ID || "";
+  const bundleId = url.searchParams.get("bundle_id") || env.LAUNCHER_BUNDLE_ID || "";
+  let row = null;
+
+  if (projectId) {
+    row = await env.DB.prepare(
+      "SELECT * FROM builds WHERE project_id = ? AND channel = ? ORDER BY created_at DESC LIMIT 1"
+    ).bind(projectId, channel).first();
+  } else if (bundleId) {
+    row = await env.DB.prepare(
+      "SELECT builds.* FROM builds JOIN projects ON projects.id = builds.project_id WHERE projects.bundle_id = ? AND builds.channel = ? ORDER BY builds.created_at DESC LIMIT 1"
+    ).bind(bundleId, channel).first();
+  } else {
+    row = await env.DB.prepare(
+      "SELECT builds.* FROM builds JOIN projects ON projects.id = builds.project_id WHERE builds.channel = ? AND (lower(projects.name) LIKE '%launcher%' OR lower(projects.bundle_id) LIKE '%launcher%') ORDER BY builds.created_at DESC LIMIT 1"
+    ).bind(channel).first();
+    if (!row) {
+      row = await env.DB.prepare(
+        "SELECT * FROM builds WHERE channel = ? ORDER BY created_at DESC LIMIT 1"
+      ).bind(channel).first();
+    }
+  }
+
+  if (!row) return json({ error: "launcher build not found", channel }, 404);
+
+  const build = await rowToBuild(env, row, url.origin);
+  const files = build?.manifest?.files || [];
+  const artifact =
+    files.find(file => /\.(exe|msi|zip|dmg|pkg|appimage)$/i.test(String(file.path || ""))) ||
+    files[0] ||
+    null;
+  const downloadUrl = artifact?.download_url || artifact?.storage_url || "";
+  const hasUpdate = currentVersion ? compareVersions(build.version, currentVersion) > 0 : true;
+
+  return json({
+    has_update: hasUpdate,
+    is_mandatory: false,
+    version: build.version,
+    download_url: downloadUrl,
+    notes: build.changelog || "No release notes.",
+  });
+}
+
+function compareVersions(left, right) {
+  const a = String(left || "").split(".").map(part => Number.parseInt(part, 10) || 0);
+  const b = String(right || "").split(".").map(part => Number.parseInt(part, 10) || 0);
+  const limit = Math.max(a.length, b.length);
+  for (let index = 0; index < limit; index += 1) {
+    const diff = (a[index] || 0) - (b[index] || 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
 }
 
 async function downloadArtifact(request, env, user, key) {
