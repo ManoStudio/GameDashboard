@@ -230,7 +230,7 @@ async function listBuilds(env, projectId, user = null) {
   if (!project) return [];
   const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
   const visibleChannels = new Set(visibleChannelsForRole(user?.role));
-  return (results || []).filter(row => visibleChannels.has(row.channel)).map(rowToBuild);
+  return Promise.all((results || []).filter(row => visibleChannels.has(row.channel)).map(row => rowToBuild(env, row)));
 }
 
 async function listUsers(env) {
@@ -354,19 +354,24 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
   if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
   const files = payload.files || [];
   if (!files.length) return json({ error: "files are required" }, 400);
-  const manifest = {
-    generated_at: nowIso(),
-    source: "cloudflare-r2-upload",
-    file_count: files.length,
-    total_size: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
-    files: files.map(file => ({
+  const manifestFiles = await Promise.all(files.map(async file => {
+    const downloadUrl = await objectDownloadUrl(env, file.object_path);
+    return {
       path: file.name || "build.bin",
       hash: file.hash || "",
       size: Number(file.size || 0),
       content_type: file.content_type || "application/octet-stream",
       storage_object: file.object_path,
-      storage_url: publicObjectUrl(env, file.object_path),
-    })),
+      storage_url: downloadUrl,
+      download_url: downloadUrl,
+    };
+  }));
+  const manifest = {
+    generated_at: nowIso(),
+    source: "cloudflare-r2-upload",
+    file_count: files.length,
+    total_size: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
+    files: manifestFiles,
   };
   const build = await saveBuild(env, projectId, buildId, payload, manifest);
   return json(build, 201);
@@ -393,7 +398,7 @@ async function saveBuild(env, projectId, buildId, payload, manifest) {
     now,
     now
   ).run();
-  return rowToBuild(await env.DB.prepare("SELECT * FROM builds WHERE id = ?").bind(buildId).first());
+  return rowToBuild(env, await env.DB.prepare("SELECT * FROM builds WHERE id = ?").bind(buildId).first());
 }
 
 async function updateBuildChannel(request, env, user, buildId) {
@@ -419,7 +424,7 @@ async function buildManifest(env, buildId, user = null) {
   if (!build) return json({ error: "build not found" }, 404);
   const project = await getProject(env, build.project_id, user);
   if (!project || !visibleChannelsForRole(user?.role).includes(build.channel)) return json({ error: "build not found" }, 404);
-  return json(JSON.parse(build.manifest_json));
+  return json(await manifestWithDownloadUrls(env, JSON.parse(build.manifest_json)));
 }
 
 async function nextVersion(env, projectId) {
@@ -429,8 +434,12 @@ async function nextVersion(env, projectId) {
   return parts.length === 3 && parts.every(Number.isInteger) ? `${parts[0]}.${parts[1]}.${parts[2] + 1}` : `${latest.version}.1`;
 }
 
-function rowToBuild(row) {
-  return row ? { ...row, manifest: row.manifest_json ? JSON.parse(row.manifest_json) : null } : null;
+async function rowToBuild(env, row) {
+  if (!row) return null;
+  return {
+    ...row,
+    manifest: row.manifest_json ? await manifestWithDownloadUrls(env, JSON.parse(row.manifest_json)) : null,
+  };
 }
 
 function roleRank(role) {
@@ -467,9 +476,22 @@ function canAssign(role, channel) {
 }
 
 async function presignPut(env, key, contentType) {
-  const host = `${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  const bucket = env.R2_BUCKET_NAME;
-  const path = `/${bucket}/${encodeURIComponent(key).replaceAll("%2F", "/")}`;
+  return presignR2Url(env, "PUT", key, 1800, {
+    canonicalHeaders: `content-type:${contentType}\nhost:${r2Host(env)}\n`,
+    signedHeaders: "content-type;host",
+  });
+}
+
+async function presignGet(env, key) {
+  return presignR2Url(env, "GET", key, 3600, {
+    canonicalHeaders: `host:${r2Host(env)}\n`,
+    signedHeaders: "host",
+  });
+}
+
+async function presignR2Url(env, method, key, expires, options) {
+  const host = r2Host(env);
+  const path = r2Path(env, key);
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
   const dateStamp = amzDate.slice(0, 8);
@@ -479,16 +501,44 @@ async function presignPut(env, key, contentType) {
     "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
     "X-Amz-Credential": credential,
     "X-Amz-Date": amzDate,
-    "X-Amz-Expires": "1800",
-    "X-Amz-SignedHeaders": "content-type;host",
+    "X-Amz-Expires": String(expires),
+    "X-Amz-SignedHeaders": options.signedHeaders,
   });
   const canonicalQuery = [...params.entries()].map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).sort().join("&");
-  const canonicalHeaders = `content-type:${contentType}\nhost:${host}\n`;
-  const canonicalRequest = ["PUT", path, canonicalQuery, canonicalHeaders, "content-type;host", "UNSIGNED-PAYLOAD"].join("\n");
+  const canonicalRequest = [method, path, canonicalQuery, options.canonicalHeaders, options.signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
   const stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, await sha256Hex(canonicalRequest)].join("\n");
   const signingKey = await signatureKey(env.R2_SECRET_ACCESS_KEY, dateStamp, "auto", "s3");
   const signature = await hmacHex(signingKey, stringToSign);
   return `https://${host}${path}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+}
+
+function r2Host(env) {
+  return `${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+}
+
+function r2Path(env, key) {
+  return `/${env.R2_BUCKET_NAME}/${encodeURIComponent(key).replaceAll("%2F", "/")}`;
+}
+
+async function manifestWithDownloadUrls(env, manifest) {
+  const updated = { ...(manifest || {}) };
+  updated.files = await Promise.all((updated.files || []).map(async file => {
+    const entry = { ...file };
+    const key = entry.storage_object || entry.object_path;
+    if (key) {
+      const downloadUrl = await objectDownloadUrl(env, key);
+      entry.storage_object = key;
+      entry.storage_url = downloadUrl;
+      entry.download_url = downloadUrl;
+    }
+    return entry;
+  }));
+  return updated;
+}
+
+async function objectDownloadUrl(env, key) {
+  const base = (env.R2_PUBLIC_URL || "").replace(/\/$/, "");
+  return base ? `${base}/${key}` : presignGet(env, key);
 }
 
 async function signatureKey(secret, dateStamp, region, service) {
@@ -496,11 +546,6 @@ async function signatureKey(secret, dateStamp, region, service) {
   const kRegion = await hmacBytes(kDate, region);
   const kService = await hmacBytes(kRegion, service);
   return hmacBytes(kService, "aws4_request");
-}
-
-function publicObjectUrl(env, key) {
-  const base = (env.R2_PUBLIC_URL || "").replace(/\/$/, "");
-  return base ? `${base}/${key}` : `r2://${env.R2_BUCKET_NAME}/${key}`;
 }
 
 function objectPathFor(projectId, buildId, filename, index) {
