@@ -97,6 +97,20 @@ In Cloudflare Dashboard -> R2 -> bucket -> Settings -> CORS policy, use `r2-cors
 
 Replace the placeholder origin with your real Worker domain.
 
+For example, if your dashboard URL is:
+
+```text
+https://game-dashboard.my-team.workers.dev
+```
+
+then `AllowedOrigins` must include exactly:
+
+```json
+"https://game-dashboard.my-team.workers.dev"
+```
+
+If this is wrong, build upload will fail in the browser during the R2 `PUT` request.
+
 ## 6. Run or deploy
 
 ```bash
