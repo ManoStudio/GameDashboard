@@ -1,4 +1,4 @@
-const CHANNELS = ["dev", "qa", "live"];
+const CHANNELS = ["dev", "qa", "live", "deprecated"];
 const USER_ROLES = ["admin", "dev", "QA", "viewer"];
 const PASSWORD_HASH_ITERATIONS = 100000;
 
@@ -40,6 +40,10 @@ async function ensureSchema(env) {
       icon TEXT NOT NULL,
       bundle_id TEXT NOT NULL,
       role TEXT NOT NULL,
+      banner_title TEXT,
+      banner_subtitle TEXT,
+      description TEXT,
+      cover_url TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`,
@@ -66,6 +70,15 @@ async function ensureSchema(env) {
 
   for (const statement of statements) {
     await env.DB.prepare(statement).run();
+  }
+
+  const projectColumns = ["banner_title", "banner_subtitle", "description", "cover_url"];
+  for (const column of projectColumns) {
+    try {
+      await env.DB.prepare(`ALTER TABLE projects ADD COLUMN ${column} TEXT`).run();
+    } catch (error) {
+      if (!String(error.message || error).includes("duplicate column name")) throw error;
+    }
   }
 }
 
@@ -224,14 +237,14 @@ async function listProjects(env, user = null) {
       ).bind(project.id).first();
       if (!liveBuild) continue;
     }
-    visibleProjects.push(project);
+    visibleProjects.push(projectToPayload(project));
   }
   return visibleProjects;
 }
 
 async function getProject(env, id, user = null) {
   const project = await env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
-  return canAccessProject(user, project) ? project : null;
+  return canAccessProject(user, project) ? projectToPayload(project) : null;
 }
 
 async function listBuilds(env, projectId, user = null, baseUrl = "") {
@@ -239,7 +252,7 @@ async function listBuilds(env, projectId, user = null, baseUrl = "") {
   if (!project) return [];
   const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
   const visibleChannels = new Set(visibleChannelsForRole(user?.role));
-  return Promise.all((results || []).filter(row => visibleChannels.has(row.channel)).map(row => rowToBuild(env, row, baseUrl)));
+  return Promise.all((results || []).filter(row => visibleChannels.has(normalizeChannel(row.channel))).map(row => rowToBuild(env, row, baseUrl)));
 }
 
 async function listUsers(env) {
@@ -252,15 +265,39 @@ async function createProject(request, env) {
   const id = `project-${crypto.randomUUID().slice(0, 8)}`;
   const now = nowIso();
   await env.DB.prepare(
-    "INSERT INTO projects (id, name, icon, bundle_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).bind(id, field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "viewer", now, now).run();
+    "INSERT INTO projects (id, name, icon, bundle_id, role, banner_title, banner_subtitle, description, cover_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(
+    id,
+    field(form, "name"),
+    field(form, "icon") || "GM",
+    field(form, "bundle_id"),
+    field(form, "role") || "viewer",
+    field(form, "banner_title"),
+    field(form, "banner_subtitle"),
+    field(form, "description"),
+    field(form, "cover_url"),
+    now,
+    now
+  ).run();
   return redirect(`/?project=${id}`);
 }
 
 async function updateProject(request, env, id) {
   const form = await request.formData();
-  await env.DB.prepare("UPDATE projects SET name = ?, icon = ?, bundle_id = ?, role = ?, updated_at = ? WHERE id = ?")
-    .bind(field(form, "name"), field(form, "icon") || "GM", field(form, "bundle_id"), field(form, "role") || "viewer", nowIso(), id)
+  const existing = await env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
+  await env.DB.prepare("UPDATE projects SET name = ?, icon = ?, bundle_id = ?, role = ?, banner_title = ?, banner_subtitle = ?, description = ?, cover_url = ?, updated_at = ? WHERE id = ?")
+    .bind(
+      field(form, "name"),
+      field(form, "icon") || "GM",
+      field(form, "bundle_id"),
+      field(form, "role") || "viewer",
+      form.has("banner_title") ? field(form, "banner_title") : existing?.banner_title || "",
+      form.has("banner_subtitle") ? field(form, "banner_subtitle") : existing?.banner_subtitle || "",
+      form.has("description") ? field(form, "description") : existing?.description || "",
+      form.has("cover_url") ? field(form, "cover_url") : existing?.cover_url || "",
+      nowIso(),
+      id
+    )
     .run();
   return redirect(`/?project=${id}`);
 }
@@ -333,7 +370,7 @@ async function initUploadSession(request, env, user, projectId) {
   if (missing.length) return json({ error: `missing R2 config: ${missing.join(", ")}` }, 500);
 
   const payload = await request.json();
-  const channel = payload.channel || "dev";
+  const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
   if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
   const files = payload.files || [];
@@ -359,7 +396,7 @@ async function initUploadSession(request, env, user, projectId) {
 async function completeUploadSession(request, env, user, projectId, buildId) {
   const baseUrl = new URL(request.url).origin;
   const payload = await request.json();
-  const channel = payload.channel || "dev";
+  const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
   if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
   const files = payload.files || [];
@@ -390,7 +427,7 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
 async function saveBuild(env, projectId, buildId, payload, manifest, baseUrl = "") {
   const now = nowIso();
   const version = payload.version || await nextVersion(env, projectId);
-  const channel = CHANNELS.includes(payload.channel) ? payload.channel : "dev";
+  const channel = String(payload.channel || "dev").trim().toLowerCase();
   await env.DB.prepare(
     "INSERT INTO builds (id, project_id, version, channel, tag, changelog, status, file_count, total_size, storage_path, manifest_path, manifest_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?)"
   ).bind(
@@ -415,7 +452,7 @@ async function updateBuildChannel(request, env, user, buildId) {
   const payload = request.headers.get("content-type")?.includes("application/json")
     ? await request.json()
     : Object.fromEntries(await request.formData());
-  const channel = payload.channel || "dev";
+  const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
   if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
   await env.DB.prepare("UPDATE builds SET channel = ?, status = 'assigned', updated_at = ? WHERE id = ?").bind(channel, nowIso(), buildId).run();
@@ -453,13 +490,13 @@ async function buildManifest(request, env, buildId, user = null) {
   const build = await env.DB.prepare("SELECT manifest_json, project_id, channel FROM builds WHERE id = ?").bind(buildId).first();
   if (!build) return json({ error: "build not found" }, 404);
   const project = await getProject(env, build.project_id, user);
-  if (!project || !visibleChannelsForRole(user?.role).includes(build.channel)) return json({ error: "build not found" }, 404);
+  if (!project || !visibleChannelsForRole(user?.role).includes(normalizeChannel(build.channel))) return json({ error: "build not found" }, 404);
   return json(await manifestWithDownloadUrls(env, JSON.parse(build.manifest_json), new URL(request.url).origin));
 }
 
 async function launcherLatest(request, env) {
   const url = new URL(request.url);
-  const channel = CHANNELS.includes(url.searchParams.get("channel")) ? url.searchParams.get("channel") : "live";
+  const channel = normalizeChannel(url.searchParams.get("channel"), "live");
   const currentVersion = String(url.searchParams.get("current_version") || "").trim();
   const projectId = url.searchParams.get("project_id") || env.LAUNCHER_PROJECT_ID || "";
   const bundleId = url.searchParams.get("bundle_id") || env.LAUNCHER_BUNDLE_ID || "";
@@ -535,7 +572,7 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
 
   const hasUpdate = currentVersion ? compareVersions(version, currentVersion) > 0 : true;
   const fullKey = String(metadata.full_key || "").trim();
-  const patchUrl = hasUpdate ? String(metadata.patch_url || metadata.patch_download_url || "").trim() : "";
+  const patchUrl = "";
   let fullUrl = String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
   if (!fullUrl && fullKey) {
     fullUrl = await objectDownloadUrl(env, fullKey);
@@ -548,7 +585,7 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
     from_version: metadata.patch_from_version || metadata.from_version || "",
     patch_url: patchUrl,
     full_url: fullUrl,
-    download_url: hasUpdate ? (patchUrl || fullUrl) : "",
+    download_url: hasUpdate ? fullUrl : "",
     notes: metadata.notes || metadata.changelog || "No release notes.",
     channel,
     source: "r2_latest_json",
@@ -574,7 +611,7 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
 
 async function launcherHistory(request, env) {
   const url = new URL(request.url);
-  const channel = CHANNELS.includes(url.searchParams.get("channel")) ? url.searchParams.get("channel") : "live";
+  const channel = normalizeChannel(url.searchParams.get("channel"), "live");
   const projectId = url.searchParams.get("project_id") || env.LAUNCHER_PROJECT_ID || "";
   const bundleId = url.searchParams.get("bundle_id") || env.LAUNCHER_BUNDLE_ID || "";
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 20), 1), 100);
@@ -706,10 +743,35 @@ async function nextVersion(env, projectId) {
 
 async function rowToBuild(env, row, baseUrl = "") {
   if (!row) return null;
+  const channel = normalizeChannel(row.channel);
+  const manifest = row.manifest_json ? await manifestWithDownloadUrls(env, JSON.parse(row.manifest_json), baseUrl) : null;
+  const files = Array.isArray(manifest?.files) ? manifest.files : [];
+  const primaryFile = files[0] || {};
+  const downloadUrl = primaryFile.download_url || primaryFile.storage_url || "";
   return {
     ...row,
-    manifest: row.manifest_json ? await manifestWithDownloadUrls(env, JSON.parse(row.manifest_json), baseUrl) : null,
+    channel,
+    date: row.created_at || "",
+    size: Number(row.total_size || manifest?.total_size || 0),
+    download_url: downloadUrl,
+    manifest,
   };
+}
+
+function projectToPayload(project) {
+  if (!project) return null;
+  return {
+    ...project,
+    banner_title: project.banner_title || project.name || "",
+    banner_subtitle: project.banner_subtitle || project.description || "",
+    description: project.description || "",
+    cover_url: project.cover_url || "",
+  };
+}
+
+function normalizeChannel(value, fallback = "dev") {
+  const channel = String(value || fallback).trim().toLowerCase();
+  return CHANNELS.includes(channel) ? channel : fallback;
 }
 
 function roleRank(role) {
@@ -729,8 +791,8 @@ function canAccessProject(user, project) {
 }
 
 function visibleChannelsForRole(role) {
-  if (role === "admin" || role === "dev") return ["dev", "qa", "live"];
-  if (role === "QA") return ["qa", "live"];
+  if (role === "admin" || role === "dev") return ["dev", "qa", "live", "deprecated"];
+  if (role === "QA") return ["qa", "live", "deprecated"];
   return ["live"];
 }
 

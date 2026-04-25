@@ -28,7 +28,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 app.secret_key = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or "change-me-in-vercel"
 
-CHANNELS = ["dev", "qa", "live"]
+CHANNELS = ["dev", "qa", "live", "deprecated"]
 ROLES = ["admin", "dev", "QA"]
 USER_ROLES = ["admin", "dev", "QA", "viewer"]
 BUILD_STATUSES = ["uploaded", "manifest-ready", "stored", "assigned"]
@@ -204,6 +204,7 @@ def has_role(*allowed_roles):
 
 
 def can_assign_channel(role, channel):
+    channel = normalize_channel(channel)
     if role == "admin":
         return True
     if role == "dev":
@@ -211,6 +212,11 @@ def can_assign_channel(role, channel):
     if role == "QA":
         return channel == "qa"
     return False
+
+
+def normalize_channel(channel, fallback="dev"):
+    normalized = str(channel or fallback).strip().lower()
+    return normalized if normalized in CHANNELS else fallback
 
 
 def unauthorized_response(status_code=401):
@@ -254,6 +260,10 @@ def seed_projects():
             "icon": "ND",
             "bundle_id": "com.mano.neondrift",
             "role": "admin",
+            "banner_title": "Neon Drift",
+            "banner_subtitle": "Initial QA candidate is ready to test.",
+            "description": "Arcade drift build for launcher smoke testing.",
+            "cover_url": "",
             "created_at": now_iso(),
         },
         {
@@ -262,6 +272,10 @@ def seed_projects():
             "icon": "SA",
             "bundle_id": "com.mano.skyarena",
             "role": "dev",
+            "banner_title": "Sky Arena",
+            "banner_subtitle": "Dev channel builds with gradient fallback.",
+            "description": "Arena prototype for launcher integration.",
+            "cover_url": "",
             "created_at": now_iso(),
         },
     ]
@@ -293,47 +307,55 @@ bootstrap_admin_user()
 
 def list_projects():
     if db is None:
-        return sorted(demo_projects, key=lambda project: project.get("created_at", ""), reverse=True)
+        projects = sorted(demo_projects, key=lambda project: project.get("created_at", ""), reverse=True)
+        return [project_payload(project) for project in projects]
     projects = db.collection("projects").order_by("created_at", direction=firestore.Query.DESCENDING).stream()
-    return [document_with_id(project) for project in projects]
+    return [project_payload(document_with_id(project)) for project in projects]
 
 
 def get_project(project_id):
     if db is None:
-        return next((project for project in demo_projects if project["id"] == project_id), None)
+        project = next((project for project in demo_projects if project["id"] == project_id), None)
+        return project_payload(project) if project else None
     snapshot = db.collection("projects").document(project_id).get()
     if not snapshot.exists:
         return None
-    return document_with_id(snapshot)
+    return project_payload(document_with_id(snapshot))
 
 
 def list_builds(project_id):
     if db is None:
         builds = demo_builds.get(project_id, [])
-        return sorted(builds, key=lambda build: build.get("created_at", ""), reverse=True)
+        builds = sorted(builds, key=lambda build: build.get("created_at", ""), reverse=True)
+        return [build_payload(build) for build in builds]
     query = db.collection("builds").where("project_id", "==", project_id)
     try:
         builds = query.order_by("created_at", direction=firestore.Query.DESCENDING).stream()
-        return [document_with_id(build) for build in builds]
+        return [build_payload(document_with_id(build)) for build in builds]
     except google_exceptions.FailedPrecondition as exc:
         if "requires an index" not in str(exc):
             raise
 
-        builds = [document_with_id(build) for build in query.stream()]
+        builds = [build_payload(document_with_id(build)) for build in query.stream()]
         return sorted(builds, key=lambda build: build.get("created_at", ""), reverse=True)
 
 
 def get_build(build_id):
     if db is None:
-        for builds in demo_builds.values():
-            build = next((item for item in builds if item["id"] == build_id), None)
-            if build:
-                return build
-        return None
+        build = find_demo_build(build_id)
+        return build_payload(build) if build else None
     snapshot = db.collection("builds").document(build_id).get()
     if not snapshot.exists:
         return None
-    return document_with_id(snapshot)
+    return build_payload(document_with_id(snapshot))
+
+
+def find_demo_build(build_id):
+    for builds in demo_builds.values():
+        build = next((item for item in builds if item["id"] == build_id), None)
+        if build:
+            return build
+    return None
 
 
 def next_version(project_id, manual_version):
@@ -452,6 +474,30 @@ def manifest_with_download_urls(manifest):
     return manifest
 
 
+def project_payload(project):
+    payload = dict(project or {})
+    payload["banner_title"] = payload.get("banner_title") or payload.get("name", "")
+    payload["banner_subtitle"] = payload.get("banner_subtitle") or payload.get("description", "")
+    payload["description"] = payload.get("description") or ""
+    payload["cover_url"] = payload.get("cover_url") or ""
+    return payload
+
+
+def build_payload(build):
+    payload = dict(build or {})
+    manifest = manifest_with_download_urls(payload.get("manifest") or {"files": []})
+    files = manifest.get("files") or []
+    primary_file = files[0] if files else {}
+    payload["channel"] = normalize_channel(payload.get("channel"))
+    payload["date"] = payload.get("created_at", "")
+    payload["size"] = int(payload.get("total_size") or manifest.get("total_size") or 0)
+    payload["download_url"] = primary_file.get("download_url") or primary_file.get("storage_url") or ""
+    payload["manifest"] = manifest
+    payload.setdefault("status", "")
+    payload.setdefault("changelog", "")
+    return payload
+
+
 def manifest_from_uploads(uploads):
     entries = []
 
@@ -525,11 +571,16 @@ def manifest_from_uploaded_files(files):
 
 
 def save_project(data, project_id=None):
+    existing_project = get_project(project_id) if project_id else {}
     project = {
         "name": data.get("name", "").strip(),
         "icon": data.get("icon", "").strip() or "GM",
         "bundle_id": data.get("bundle_id", "").strip(),
         "role": data.get("role", "dev"),
+        "banner_title": data.get("banner_title", existing_project.get("banner_title", "")).strip(),
+        "banner_subtitle": data.get("banner_subtitle", existing_project.get("banner_subtitle", "")).strip(),
+        "description": data.get("description", existing_project.get("description", "")).strip(),
+        "cover_url": data.get("cover_url", existing_project.get("cover_url", "")).strip(),
         "updated_at": now_iso(),
     }
     if not project_id:
@@ -594,9 +645,7 @@ def delete_project(project_id):
 def save_build_record(project_id, form, manifest, build_id=None, version=None):
     build_id = build_id or f"build-{uuid.uuid4().hex[:12]}"
     version = version or next_version(project_id, form.get("version", "").strip())
-    channel = form.get("channel", "dev")
-    if channel not in CHANNELS:
-        channel = "dev"
+    channel = normalize_channel(form.get("channel", "dev"))
 
     build = {
         "project_id": project_id,
@@ -620,7 +669,7 @@ def save_build_record(project_id, form, manifest, build_id=None, version=None):
         demo_builds.setdefault(project_id, []).append(build)
 
     build["id"] = build_id
-    return build
+    return build_payload(build)
 
 
 def save_build(project_id, form, uploads):
@@ -744,7 +793,7 @@ def init_storage_upload(project_id):
         return jsonify({"error": "project not found"}), 404
 
     payload = request.get_json(silent=True) or {}
-    channel = payload.get("channel", "dev")
+    channel = str(payload.get("channel", "dev")).strip().lower()
     if channel not in CHANNELS:
         return jsonify({"error": "invalid channel"}), 400
     if not can_assign_channel(current_user().get("role"), channel):
@@ -792,7 +841,7 @@ def complete_storage_upload(project_id, build_id):
         return jsonify({"error": "project not found"}), 404
 
     payload = request.get_json(silent=True) or {}
-    channel = payload.get("channel", "dev")
+    channel = str(payload.get("channel", "dev")).strip().lower()
     if channel not in CHANNELS:
         return jsonify({"error": "invalid channel"}), 400
     if not can_assign_channel(current_user().get("role"), channel):
@@ -815,7 +864,9 @@ def upload_build(project_id):
     if not uploads:
         response = {"error": "build file is required"}
         return (jsonify(response), 400) if wants_json() else redirect(url_for("index", project=project_id))
-    channel = request.form.get("channel", "dev")
+    channel = str(request.form.get("channel", "dev")).strip().lower()
+    if channel not in CHANNELS:
+        return (jsonify({"error": "invalid channel"}), 400) if wants_json() else redirect(url_for("index", project=project_id))
     if not can_assign_channel(current_user().get("role"), channel):
         return (jsonify({"error": "forbidden"}), 403) if wants_json() else redirect(url_for("index", project=project_id))
 
@@ -865,7 +916,7 @@ def build_manifest(build_id):
 @role_required("admin", "dev", "QA")
 def update_build_channel(build_id):
     payload = request.get_json(silent=True) if request.is_json else request.form
-    channel = payload.get("channel", "dev")
+    channel = str(payload.get("channel", "dev")).strip().lower()
     if channel not in CHANNELS:
         return jsonify({"error": "invalid channel"}), 400
     user = current_user()
@@ -881,7 +932,9 @@ def update_build_channel(build_id):
             {"channel": channel, "status": "assigned", "updated_at": now_iso()}
         )
     else:
-        build.update({"channel": channel, "status": "assigned", "updated_at": now_iso()})
+        demo_build = find_demo_build(build_id)
+        if demo_build:
+            demo_build.update({"channel": channel, "status": "assigned", "updated_at": now_iso()})
 
     if wants_json():
         return jsonify({"id": build_id, "channel": channel})
@@ -900,7 +953,9 @@ def rollback_build(build_id):
             {"channel": "live", "tag": "rollback", "updated_at": now_iso()}
         )
     else:
-        build.update({"channel": "live", "tag": "rollback", "updated_at": now_iso()})
+        demo_build = find_demo_build(build_id)
+        if demo_build:
+            demo_build.update({"channel": "live", "tag": "rollback", "updated_at": now_iso()})
 
     return redirect(url_for("index", project=build["project_id"]))
 

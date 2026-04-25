@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS projects (
   icon TEXT NOT NULL,
   bundle_id TEXT NOT NULL,
   role TEXT NOT NULL,
+  banner_title TEXT,
+  banner_subtitle TEXT,
+  description TEXT,
+  cover_url TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
