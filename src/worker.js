@@ -484,7 +484,11 @@ async function launcherLatest(request, env) {
     }
   }
 
-  if (!row) return json({ error: "launcher build not found", channel }, 404);
+  if (!row) {
+    const r2Latest = await launcherLatestFromR2(env, currentVersion, channel);
+    if (r2Latest) return json(r2Latest);
+    return json({ error: "launcher build not found", channel }, 404);
+  }
 
   const build = await rowToBuild(env, row, url.origin);
   const files = build?.manifest?.files || [];
@@ -518,6 +522,54 @@ async function launcherLatest(request, env) {
       patches,
     },
   });
+}
+
+async function launcherLatestFromR2(env, currentVersion, channel) {
+  const key = env.LAUNCHER_LATEST_KEY || "launcher/latest.json";
+  const object = await env.BUILDS_BUCKET.get(key);
+  if (!object) return null;
+
+  const metadata = await object.json();
+  const version = String(metadata.version || metadata.latest_version || "").trim();
+  if (!version) return null;
+
+  const hasUpdate = currentVersion ? compareVersions(version, currentVersion) > 0 : true;
+  const fullKey = String(metadata.full_key || "").trim();
+  const patchUrl = hasUpdate ? String(metadata.patch_url || metadata.patch_download_url || "").trim() : "";
+  let fullUrl = String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
+  if (!fullUrl && fullKey) {
+    fullUrl = await objectDownloadUrl(env, fullKey);
+  }
+
+  return {
+    has_update: hasUpdate,
+    is_mandatory: Boolean(metadata.is_mandatory),
+    version,
+    from_version: metadata.patch_from_version || metadata.from_version || "",
+    patch_url: patchUrl,
+    full_url: fullUrl,
+    download_url: hasUpdate ? (patchUrl || fullUrl) : "",
+    notes: metadata.notes || metadata.changelog || "No release notes.",
+    channel,
+    source: "r2_latest_json",
+    release: {
+      version,
+      is_mandatory: Boolean(metadata.is_mandatory),
+      notes: metadata.notes || metadata.changelog || "No release notes.",
+      full_url: fullUrl,
+      full_hash: metadata.full_hash || metadata.hash || "",
+      full_size: Number(metadata.full_size || metadata.size || 0),
+      patches: patchUrl
+        ? [{
+            from_version: metadata.patch_from_version || metadata.from_version || "",
+            to_version: version,
+            patch_url: patchUrl,
+            hash: metadata.patch_hash || "",
+            size: Number(metadata.patch_size || 0),
+          }]
+        : [],
+    },
+  };
 }
 
 async function launcherHistory(request, env) {
