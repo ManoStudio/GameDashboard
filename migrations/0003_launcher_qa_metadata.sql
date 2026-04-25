@@ -1,0 +1,20 @@
+ALTER TABLE projects ADD COLUMN known_issues TEXT;
+ALTER TABLE projects ADD COLUMN test_instructions TEXT;
+ALTER TABLE projects ADD COLUMN focus_areas TEXT;
+ALTER TABLE projects ADD COLUMN maintenance_notice TEXT;
+ALTER TABLE projects ADD COLUMN save_path_hint TEXT;
+ALTER TABLE projects ADD COLUMN config_path_hint TEXT;
+ALTER TABLE projects ADD COLUMN recommended_profile TEXT;
+
+ALTER TABLE builds ADD COLUMN commit_sha TEXT;
+ALTER TABLE builds ADD COLUMN uploaded_by TEXT;
+ALTER TABLE builds ADD COLUMN uploaded_at TEXT;
+ALTER TABLE builds ADD COLUMN manifest_id TEXT;
+ALTER TABLE builds ADD COLUMN checksum TEXT;
+ALTER TABLE builds ADD COLUMN branch TEXT;
+ALTER TABLE builds ADD COLUMN build_source TEXT;
+ALTER TABLE builds ADD COLUMN known_issues TEXT;
+ALTER TABLE builds ADD COLUMN test_instructions TEXT;
+ALTER TABLE builds ADD COLUMN focus_areas TEXT;
+ALTER TABLE builds ADD COLUMN save_path_hint TEXT;
+ALTER TABLE builds ADD COLUMN config_path_hint TEXT;

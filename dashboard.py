@@ -264,6 +264,13 @@ def seed_projects():
             "banner_subtitle": "Initial QA candidate is ready to test.",
             "description": "Arcade drift build for launcher smoke testing.",
             "cover_url": "",
+            "known_issues": json.dumps(["Controller remap needs another QA pass"]),
+            "test_instructions": "Focus on launch, login, and one complete race.",
+            "focus_areas": json.dumps(["Focus Test", "Input", "Patch Flow"]),
+            "maintenance_notice": "",
+            "save_path_hint": "",
+            "config_path_hint": "",
+            "recommended_profile": "qa",
             "created_at": now_iso(),
         },
         {
@@ -276,6 +283,13 @@ def seed_projects():
             "banner_subtitle": "Dev channel builds with gradient fallback.",
             "description": "Arena prototype for launcher integration.",
             "cover_url": "",
+            "known_issues": json.dumps([]),
+            "test_instructions": "Use the Debug profile and verify logs are created.",
+            "focus_areas": json.dumps(["Debug", "Logs"]),
+            "maintenance_notice": "",
+            "save_path_hint": "",
+            "config_path_hint": "",
+            "recommended_profile": "debug",
             "created_at": now_iso(),
         },
     ]
@@ -291,6 +305,18 @@ def seed_builds(project_id):
             "tag": "stable",
             "changelog": "Initial QA candidate",
             "status": "assigned",
+            "commit_sha": "",
+            "uploaded_by": "demo",
+            "uploaded_at": now_iso(),
+            "manifest_id": "",
+            "checksum": "",
+            "branch": "",
+            "build_source": "demo-seed",
+            "known_issues": json.dumps([]),
+            "test_instructions": "",
+            "focus_areas": json.dumps([]),
+            "save_path_hint": "",
+            "config_path_hint": "",
             "file_count": 128,
             "total_size": 73400320,
             "storage_path": f"/{project_id}/{project_id}-build-100/files",
@@ -315,12 +341,16 @@ def list_projects():
 
 def get_project(project_id):
     if db is None:
-        project = next((project for project in demo_projects if project["id"] == project_id), None)
+        project = find_demo_project(project_id)
         return project_payload(project) if project else None
     snapshot = db.collection("projects").document(project_id).get()
     if not snapshot.exists:
         return None
     return project_payload(document_with_id(snapshot))
+
+
+def find_demo_project(project_id):
+    return next((project for project in demo_projects if project["id"] == project_id), None)
 
 
 def list_builds(project_id):
@@ -480,6 +510,13 @@ def project_payload(project):
     payload["banner_subtitle"] = payload.get("banner_subtitle") or payload.get("description", "")
     payload["description"] = payload.get("description") or ""
     payload["cover_url"] = payload.get("cover_url") or ""
+    payload["known_issues"] = metadata_list(payload.get("known_issues"))
+    payload["focus_areas"] = metadata_list(payload.get("focus_areas"))
+    payload["test_instructions"] = payload.get("test_instructions") or ""
+    payload["maintenance_notice"] = payload.get("maintenance_notice") or ""
+    payload["save_path_hint"] = payload.get("save_path_hint") or ""
+    payload["config_path_hint"] = payload.get("config_path_hint") or ""
+    payload["recommended_profile"] = payload.get("recommended_profile") or ""
     return payload
 
 
@@ -489,13 +526,56 @@ def build_payload(build):
     files = manifest.get("files") or []
     primary_file = files[0] if files else {}
     payload["channel"] = normalize_channel(payload.get("channel"))
+    payload["build_id"] = payload.get("id", "")
     payload["date"] = payload.get("created_at", "")
+    payload["uploaded_at"] = payload.get("uploaded_at") or payload.get("created_at", "")
     payload["size"] = int(payload.get("total_size") or manifest.get("total_size") or 0)
     payload["download_url"] = primary_file.get("download_url") or primary_file.get("storage_url") or ""
+    payload["known_issues"] = metadata_list(payload.get("known_issues"))
+    payload["focus_areas"] = metadata_list(payload.get("focus_areas"))
+    payload["test_instructions"] = payload.get("test_instructions") or ""
+    payload["save_path_hint"] = payload.get("save_path_hint") or ""
+    payload["config_path_hint"] = payload.get("config_path_hint") or ""
+    payload["commit_sha"] = payload.get("commit_sha") or ""
+    payload["uploaded_by"] = payload.get("uploaded_by") or ""
+    payload["manifest_id"] = payload.get("manifest_id") or ""
+    payload["checksum"] = payload.get("checksum") or payload.get("manifest_id") or ""
+    payload["branch"] = payload.get("branch") or ""
+    payload["build_source"] = payload.get("build_source") or ""
     payload["manifest"] = manifest
     payload.setdefault("status", "")
     payload.setdefault("changelog", "")
     return payload
+
+
+def metadata_text(source, key):
+    value = source.get(key, "")
+    if isinstance(value, list):
+        return json.dumps([str(item).strip() for item in value if str(item).strip()])
+    return str(value or "").strip()
+
+
+def metadata_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except (TypeError, ValueError):
+        pass
+    return [item.strip().lstrip("-* ") for item in text.splitlines() if item.strip()]
+
+
+def get_with_existing(data, existing, key):
+    if key in data:
+        return metadata_text(data, key)
+    return existing.get(key, "")
 
 
 def manifest_from_uploads(uploads):
@@ -581,6 +661,13 @@ def save_project(data, project_id=None):
         "banner_subtitle": data.get("banner_subtitle", existing_project.get("banner_subtitle", "")).strip(),
         "description": data.get("description", existing_project.get("description", "")).strip(),
         "cover_url": data.get("cover_url", existing_project.get("cover_url", "")).strip(),
+        "known_issues": get_with_existing(data, existing_project, "known_issues"),
+        "test_instructions": get_with_existing(data, existing_project, "test_instructions"),
+        "focus_areas": get_with_existing(data, existing_project, "focus_areas"),
+        "maintenance_notice": get_with_existing(data, existing_project, "maintenance_notice"),
+        "save_path_hint": get_with_existing(data, existing_project, "save_path_hint"),
+        "config_path_hint": get_with_existing(data, existing_project, "config_path_hint"),
+        "recommended_profile": get_with_existing(data, existing_project, "recommended_profile"),
         "updated_at": now_iso(),
     }
     if not project_id:
@@ -589,7 +676,7 @@ def save_project(data, project_id=None):
     if db is None:
         project["id"] = project_id or f"project-{uuid.uuid4().hex[:8]}"
         if project_id:
-            existing = get_project(project_id)
+            existing = find_demo_project(project_id)
             if existing:
                 existing.update(project)
         else:
@@ -646,6 +733,11 @@ def save_build_record(project_id, form, manifest, build_id=None, version=None):
     build_id = build_id or f"build-{uuid.uuid4().hex[:12]}"
     version = version or next_version(project_id, form.get("version", "").strip())
     channel = normalize_channel(form.get("channel", "dev"))
+    now = now_iso()
+    manifest_hash = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest()
+    user = current_user() or {}
+    uploaded_at = form.get("uploaded_at", "").strip() or now
+    uploaded_by = form.get("uploaded_by", "").strip() or user.get("email", "")
 
     build = {
         "project_id": project_id,
@@ -654,13 +746,25 @@ def save_build_record(project_id, form, manifest, build_id=None, version=None):
         "tag": form.get("tag", "").strip(),
         "changelog": form.get("changelog", "").strip() or "Manual upload",
         "status": "assigned",
+        "commit_sha": form.get("commit_sha", "").strip(),
+        "uploaded_by": uploaded_by,
+        "uploaded_at": uploaded_at,
+        "manifest_id": form.get("manifest_id", "").strip() or manifest_hash,
+        "checksum": form.get("checksum", "").strip() or manifest_hash,
+        "branch": form.get("branch", "").strip(),
+        "build_source": form.get("build_source", "").strip(),
+        "known_issues": metadata_text(form, "known_issues"),
+        "test_instructions": metadata_text(form, "test_instructions"),
+        "focus_areas": metadata_text(form, "focus_areas"),
+        "save_path_hint": form.get("save_path_hint", "").strip(),
+        "config_path_hint": form.get("config_path_hint", "").strip(),
         "file_count": manifest["file_count"],
         "total_size": manifest["total_size"],
         "storage_path": f"/{project_id}/{build_id}/files",
         "manifest_path": f"/{project_id}/{build_id}/manifest.json",
         "manifest": manifest,
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
+        "created_at": now,
+        "updated_at": now,
     }
 
     if db is not None:

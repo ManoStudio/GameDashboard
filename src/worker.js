@@ -44,6 +44,13 @@ async function ensureSchema(env) {
       banner_subtitle TEXT,
       description TEXT,
       cover_url TEXT,
+      known_issues TEXT,
+      test_instructions TEXT,
+      focus_areas TEXT,
+      maintenance_notice TEXT,
+      save_path_hint TEXT,
+      config_path_hint TEXT,
+      recommended_profile TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`,
@@ -55,6 +62,18 @@ async function ensureSchema(env) {
       tag TEXT,
       changelog TEXT,
       status TEXT NOT NULL,
+      commit_sha TEXT,
+      uploaded_by TEXT,
+      uploaded_at TEXT,
+      manifest_id TEXT,
+      checksum TEXT,
+      branch TEXT,
+      build_source TEXT,
+      known_issues TEXT,
+      test_instructions TEXT,
+      focus_areas TEXT,
+      save_path_hint TEXT,
+      config_path_hint TEXT,
       file_count INTEGER NOT NULL,
       total_size INTEGER NOT NULL,
       storage_path TEXT NOT NULL,
@@ -72,10 +91,26 @@ async function ensureSchema(env) {
     await env.DB.prepare(statement).run();
   }
 
-  const projectColumns = ["banner_title", "banner_subtitle", "description", "cover_url"];
+  const projectColumns = [
+    "banner_title", "banner_subtitle", "description", "cover_url",
+    "known_issues", "test_instructions", "focus_areas", "maintenance_notice",
+    "save_path_hint", "config_path_hint", "recommended_profile",
+  ];
+  const buildColumns = [
+    "commit_sha", "uploaded_by", "uploaded_at", "manifest_id", "checksum",
+    "branch", "build_source", "known_issues", "test_instructions",
+    "focus_areas", "save_path_hint", "config_path_hint",
+  ];
   for (const column of projectColumns) {
     try {
       await env.DB.prepare(`ALTER TABLE projects ADD COLUMN ${column} TEXT`).run();
+    } catch (error) {
+      if (!String(error.message || error).includes("duplicate column name")) throw error;
+    }
+  }
+  for (const column of buildColumns) {
+    try {
+      await env.DB.prepare(`ALTER TABLE builds ADD COLUMN ${column} TEXT`).run();
     } catch (error) {
       if (!String(error.message || error).includes("duplicate column name")) throw error;
     }
@@ -264,18 +299,26 @@ async function createProject(request, env) {
   const form = await request.formData();
   const id = `project-${crypto.randomUUID().slice(0, 8)}`;
   const now = nowIso();
+  const metadata = projectMetadataFromForm(form, {});
   await env.DB.prepare(
-    "INSERT INTO projects (id, name, icon, bundle_id, role, banner_title, banner_subtitle, description, cover_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO projects (id, name, icon, bundle_id, role, banner_title, banner_subtitle, description, cover_url, known_issues, test_instructions, focus_areas, maintenance_notice, save_path_hint, config_path_hint, recommended_profile, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).bind(
     id,
     field(form, "name"),
     field(form, "icon") || "GM",
     field(form, "bundle_id"),
     field(form, "role") || "viewer",
-    field(form, "banner_title"),
-    field(form, "banner_subtitle"),
-    field(form, "description"),
-    field(form, "cover_url"),
+    metadata.banner_title,
+    metadata.banner_subtitle,
+    metadata.description,
+    metadata.cover_url,
+    metadata.known_issues,
+    metadata.test_instructions,
+    metadata.focus_areas,
+    metadata.maintenance_notice,
+    metadata.save_path_hint,
+    metadata.config_path_hint,
+    metadata.recommended_profile,
     now,
     now
   ).run();
@@ -285,16 +328,24 @@ async function createProject(request, env) {
 async function updateProject(request, env, id) {
   const form = await request.formData();
   const existing = await env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first();
-  await env.DB.prepare("UPDATE projects SET name = ?, icon = ?, bundle_id = ?, role = ?, banner_title = ?, banner_subtitle = ?, description = ?, cover_url = ?, updated_at = ? WHERE id = ?")
+  const metadata = projectMetadataFromForm(form, existing || {});
+  await env.DB.prepare("UPDATE projects SET name = ?, icon = ?, bundle_id = ?, role = ?, banner_title = ?, banner_subtitle = ?, description = ?, cover_url = ?, known_issues = ?, test_instructions = ?, focus_areas = ?, maintenance_notice = ?, save_path_hint = ?, config_path_hint = ?, recommended_profile = ?, updated_at = ? WHERE id = ?")
     .bind(
       field(form, "name"),
       field(form, "icon") || "GM",
       field(form, "bundle_id"),
       field(form, "role") || "viewer",
-      form.has("banner_title") ? field(form, "banner_title") : existing?.banner_title || "",
-      form.has("banner_subtitle") ? field(form, "banner_subtitle") : existing?.banner_subtitle || "",
-      form.has("description") ? field(form, "description") : existing?.description || "",
-      form.has("cover_url") ? field(form, "cover_url") : existing?.cover_url || "",
+      metadata.banner_title,
+      metadata.banner_subtitle,
+      metadata.description,
+      metadata.cover_url,
+      metadata.known_issues,
+      metadata.test_instructions,
+      metadata.focus_areas,
+      metadata.maintenance_notice,
+      metadata.save_path_hint,
+      metadata.config_path_hint,
+      metadata.recommended_profile,
       nowIso(),
       id
     )
@@ -420,28 +471,44 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
     total_size: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
     files: manifestFiles,
   };
-  const build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl);
+  const build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl, user);
   return json(build, 201);
 }
 
-async function saveBuild(env, projectId, buildId, payload, manifest, baseUrl = "") {
+async function saveBuild(env, projectId, buildId, payload, manifest, baseUrl = "", user = null) {
   const now = nowIso();
   const version = payload.version || await nextVersion(env, projectId);
   const channel = String(payload.channel || "dev").trim().toLowerCase();
+  const manifestJson = JSON.stringify(manifest);
+  const manifestId = stringField(payload, "manifest_id") || await sha256Hex(manifestJson);
+  const uploadedAt = stringField(payload, "uploaded_at") || now;
+  const uploadedBy = stringField(payload, "uploaded_by") || user?.email || "";
   await env.DB.prepare(
-    "INSERT INTO builds (id, project_id, version, channel, tag, changelog, status, file_count, total_size, storage_path, manifest_path, manifest_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO builds (id, project_id, version, channel, tag, changelog, status, commit_sha, uploaded_by, uploaded_at, manifest_id, checksum, branch, build_source, known_issues, test_instructions, focus_areas, save_path_hint, config_path_hint, file_count, total_size, storage_path, manifest_path, manifest_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).bind(
     buildId,
     projectId,
     version,
     channel,
-    payload.tag || "",
-    payload.changelog || "Manual upload",
+    stringField(payload, "tag"),
+    stringField(payload, "changelog") || "Manual upload",
+    stringField(payload, "commit_sha"),
+    uploadedBy,
+    uploadedAt,
+    manifestId,
+    stringField(payload, "checksum") || manifestId,
+    stringField(payload, "branch"),
+    stringField(payload, "build_source"),
+    metadataText(payload, "known_issues"),
+    metadataText(payload, "test_instructions"),
+    metadataText(payload, "focus_areas"),
+    stringField(payload, "save_path_hint"),
+    stringField(payload, "config_path_hint"),
     manifest.file_count,
     manifest.total_size,
     `r2://${env.R2_BUCKET_NAME}/builds/${projectId}/${buildId}/files`,
     `r2://${env.R2_BUCKET_NAME}/builds/${projectId}/${buildId}/manifest.json`,
-    JSON.stringify(manifest),
+    manifestJson,
     now,
     now
   ).run();
@@ -750,10 +817,23 @@ async function rowToBuild(env, row, baseUrl = "") {
   const downloadUrl = primaryFile.download_url || primaryFile.storage_url || "";
   return {
     ...row,
+    build_id: row.id,
     channel,
     date: row.created_at || "",
+    uploaded_at: row.uploaded_at || row.created_at || "",
     size: Number(row.total_size || manifest?.total_size || 0),
     download_url: downloadUrl,
+    known_issues: parseMetadataList(row.known_issues),
+    focus_areas: parseMetadataList(row.focus_areas),
+    test_instructions: row.test_instructions || "",
+    save_path_hint: row.save_path_hint || "",
+    config_path_hint: row.config_path_hint || "",
+    commit_sha: row.commit_sha || "",
+    uploaded_by: row.uploaded_by || "",
+    manifest_id: row.manifest_id || "",
+    checksum: row.checksum || row.manifest_id || "",
+    branch: row.branch || "",
+    build_source: row.build_source || "",
     manifest,
   };
 }
@@ -766,7 +846,56 @@ function projectToPayload(project) {
     banner_subtitle: project.banner_subtitle || project.description || "",
     description: project.description || "",
     cover_url: project.cover_url || "",
+    known_issues: parseMetadataList(project.known_issues),
+    focus_areas: parseMetadataList(project.focus_areas),
+    test_instructions: project.test_instructions || "",
+    maintenance_notice: project.maintenance_notice || "",
+    save_path_hint: project.save_path_hint || "",
+    config_path_hint: project.config_path_hint || "",
+    recommended_profile: project.recommended_profile || "",
   };
+}
+
+function projectMetadataFromForm(form, existing = {}) {
+  return {
+    banner_title: formValueOrExisting(form, existing, "banner_title"),
+    banner_subtitle: formValueOrExisting(form, existing, "banner_subtitle"),
+    description: formValueOrExisting(form, existing, "description"),
+    cover_url: formValueOrExisting(form, existing, "cover_url"),
+    known_issues: formValueOrExisting(form, existing, "known_issues"),
+    test_instructions: formValueOrExisting(form, existing, "test_instructions"),
+    focus_areas: formValueOrExisting(form, existing, "focus_areas"),
+    maintenance_notice: formValueOrExisting(form, existing, "maintenance_notice"),
+    save_path_hint: formValueOrExisting(form, existing, "save_path_hint"),
+    config_path_hint: formValueOrExisting(form, existing, "config_path_hint"),
+    recommended_profile: formValueOrExisting(form, existing, "recommended_profile"),
+  };
+}
+
+function formValueOrExisting(form, existing, key) {
+  return form.has(key) ? field(form, key) : existing?.[key] || "";
+}
+
+function stringField(source, key) {
+  return String(source?.[key] || "").trim();
+}
+
+function metadataText(source, key) {
+  const value = source?.[key];
+  return Array.isArray(value) ? JSON.stringify(value) : String(value || "").trim();
+}
+
+function parseMetadataList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(item => String(item).trim()).filter(Boolean);
+  const text = String(value).trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed.map(item => String(item).trim()).filter(Boolean);
+  } catch {
+  }
+  return text.split(/\r?\n/).map(item => item.replace(/^[-*]\s*/, "").trim()).filter(Boolean);
 }
 
 function normalizeChannel(value, fallback = "dev") {
