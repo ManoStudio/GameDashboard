@@ -1,3 +1,5 @@
+import { MODERN_THEME_STYLE } from "./modern-theme.js";
+
 const CHANNELS = ["dev", "qa", "live", "deprecated"];
 const USER_ROLES = ["admin", "dev", "QA", "viewer"];
 const PASSWORD_HASH_ITERATIONS = 100000;
@@ -1130,7 +1132,42 @@ function json(data, status = 200, headers = {}) {
 }
 
 function html(body, status = 200) {
-  return new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return new Response(decorateHtml(body), { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+function decorateHtml(body) {
+  const isLogin = body.includes("<title>Login</title>");
+  const isDashboard = body.includes("<title>Build Producer Dashboard</title>");
+  if (!isLogin && !isDashboard) return body;
+
+  let decorated = body
+    .replace("</head>", `<style>${MODERN_THEME_STYLE}</style></head>`)
+    .replace("<title>Login</title>", "<title>Login | Game Build Dashboard</title>")
+    .replace("<title>Build Producer Dashboard</title>", "<title>Game Build Dashboard</title>")
+    .replace("Dashboard API / R2 Storage / D1 Metadata / Role Auth", "Game build operations");
+
+  if (isLogin) {
+    decorated = decorated.replace(
+      '<main class="login panel">',
+      `<main class="login panel">${themeToggleMarkup()}`,
+    );
+  }
+  if (isDashboard) {
+    decorated = decorated.replace(
+      '<div class="actions">',
+      `<div class="actions">${themeToggleMarkup()}`,
+    );
+  }
+
+  return `${decorated}${themeScript()}`;
+}
+
+function themeToggleMarkup() {
+  return `<button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="Switch to light theme" title="Switch theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3.5"></circle><path d="M12 2.5v2M12 19.5v2M4.1 4.1l1.4 1.4M18.5 18.5l1.4 1.4M2.5 12h2M19.5 12h2M4.1 19.9l1.4-1.4M18.5 5.5l1.4-1.4"></path></svg></button>`;
+}
+
+function themeScript() {
+  return `<script>(function(){const key="game-build-dashboard-theme";function applyTheme(theme){document.documentElement.dataset.theme=theme;try{window.localStorage.setItem(key,theme)}catch{}document.querySelectorAll("[data-theme-toggle]").forEach(button=>{const next=theme==="dark"?"light":"dark";button.setAttribute("aria-label","Switch to "+next+" theme");button.setAttribute("title","Switch to "+next+" theme")})}const initial=window.localStorage.getItem(key)==="light"?"light":"dark";applyTheme(initial);document.querySelectorAll("[data-theme-toggle]").forEach(button=>button.addEventListener("click",()=>applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark")))})();</script>`;
 }
 
 function notFound() {
