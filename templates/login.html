@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login | Build Producer Dashboard</title>
+    <title>Login | Game Build Dashboard</title>
     <style>
         :root {
             --ink: #16211f;
@@ -166,10 +166,155 @@
             }
         }
     </style>
+    <style>
+        :root {
+            color-scheme: dark;
+            --page: #0b1016;
+            --panel: #151f2a;
+            --field: #101821;
+            --ink: #f2f6fb;
+            --muted: #8ea1b5;
+            --line: #2a3b4c;
+            --cyan: #54d9ff;
+            --cyan-soft: rgba(84, 217, 255, 0.12);
+            --rose: #f27686;
+            --rose-soft: rgba(242, 118, 134, 0.12);
+            --shadow: 0 22px 60px rgba(0, 0, 0, 0.22);
+        }
+
+        :root[data-theme="light"] {
+            color-scheme: light;
+            --page: #f4f7fa;
+            --panel: #ffffff;
+            --field: #ffffff;
+            --ink: #17212b;
+            --muted: #6c7d8f;
+            --line: #d7e1ea;
+            --cyan: #079dce;
+            --cyan-soft: rgba(7, 157, 206, 0.11);
+            --rose: #d64f63;
+            --rose-soft: rgba(214, 79, 99, 0.1);
+            --shadow: 0 16px 38px rgba(34, 53, 72, 0.08);
+        }
+
+        html,
+        body {
+            background: var(--page);
+            color: var(--ink);
+        }
+
+        body {
+            position: relative;
+            padding: 24px;
+        }
+
+        .panel {
+            position: relative;
+            width: min(440px, 100%);
+            border-radius: 18px;
+            border-color: var(--line);
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            padding: 28px;
+        }
+
+        .mark {
+            border-radius: 13px;
+            background: var(--cyan);
+            color: #07151c;
+            box-shadow: none;
+        }
+
+        h1 {
+            color: var(--ink);
+            letter-spacing: -0.03em;
+        }
+
+        .meta,
+        .label {
+            color: var(--muted);
+        }
+
+        .label {
+            letter-spacing: 0.08em;
+        }
+
+        input {
+            min-height: 46px;
+            border-radius: 10px;
+            border-color: var(--line);
+            background: var(--field);
+            color: var(--ink);
+            outline: none;
+            transition: border-color 140ms ease, box-shadow 140ms ease;
+        }
+
+        input:focus {
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px var(--cyan-soft);
+        }
+
+        button {
+            min-height: 46px;
+            border-radius: 11px;
+            background: var(--cyan);
+            color: #07151c;
+            transition: transform 140ms ease, filter 140ms ease;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            filter: brightness(1.05);
+        }
+
+        .theme-toggle {
+            position: absolute;
+            top: 18px;
+            right: 18px;
+            width: 38px;
+            min-height: 38px;
+            padding: 0;
+            border: 1px solid var(--line);
+            background: transparent;
+            color: var(--muted);
+        }
+
+        .alert {
+            border-color: rgba(242, 118, 134, 0.35);
+            border-radius: 11px;
+            background: var(--rose-soft);
+            color: var(--rose);
+        }
+
+        .soft-load {
+            border-radius: 14px;
+            border-color: var(--line);
+            background: var(--panel);
+            color: var(--ink);
+            box-shadow: var(--shadow);
+        }
+
+        .soft-load span {
+            color: var(--muted);
+        }
+
+        .spinner {
+            border-color: var(--line);
+            border-top-color: var(--cyan);
+        }
+    </style>
 </head>
 
 <body>
     <main class="panel">
+        <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to light theme"
+            title="Switch theme">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                aria-hidden="true">
+                <circle cx="12" cy="12" r="3.5"></circle>
+                <path d="M12 2.5v2M12 19.5v2M4.1 4.1l1.4 1.4M18.5 18.5l1.4 1.4M2.5 12h2M19.5 12h2M4.1 19.9l1.4-1.4M18.5 5.5l1.4-1.4"></path>
+            </svg>
+        </button>
         <div class="brand">
             <div class="mark">BP</div>
             <div>
@@ -237,6 +382,28 @@
         document.querySelectorAll("form[data-loading-steps]").forEach((form) => {
             form.addEventListener("submit", () => {
                 showSoftLoad(form.dataset.loadingSteps.split("|"), form);
+            });
+        });
+    </script>
+    <script>
+        const themeStorageKey = "game-build-dashboard-theme";
+        const savedTheme = window.localStorage.getItem(themeStorageKey);
+
+        function applyTheme(theme) {
+            document.documentElement.dataset.theme = theme;
+            window.localStorage.setItem(themeStorageKey, theme);
+            document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+                const nextTheme = theme === "dark" ? "light" : "dark";
+                button.setAttribute("aria-label", `Switch to ${nextTheme} theme`);
+                button.setAttribute("title", `Switch to ${nextTheme} theme`);
+            });
+        }
+
+        applyTheme(savedTheme === "light" ? "light" : "dark");
+        document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const currentTheme = document.documentElement.dataset.theme || "dark";
+                applyTheme(currentTheme === "dark" ? "light" : "dark");
             });
         });
     </script>
