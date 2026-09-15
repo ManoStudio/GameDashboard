@@ -3,3 +3,8 @@ serviceAccountKey.json
 .env
 __pycache__/
 *.log
+
+node_modules/
+.local-deps/
+.wrangler/
+.preview/

@@ -7,7 +7,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, flash, jsonify, redirect, render_template, request, session, url_for
 import boto3
 from botocore.config import Config
 import firebase_admin
@@ -907,7 +907,7 @@ def logout():
 def index():
     user = current_user()
     view = request.args.get("view", "dashboard")
-    if view not in {"dashboard", "projects", "builds", "logs"}:
+    if view not in {"dashboard", "projects", "builds", "logs", "upload", "build", "log"}:
         view = "dashboard"
     projects = list_projects()
     selected_project_id = request.args.get("project") or (projects[0]["id"] if projects else None)
@@ -916,22 +916,29 @@ def index():
     latest_build = builds[0] if builds else None
     users = list_users() if user.get("role") == "admin" else []
     logs = list_logs()
-    log_project = request.args.get("log_project", "").strip()
+    log_project = request.args.get("log_project", selected_project_id or "").strip()
     log_version = request.args.get("log_version", "").strip()
     if log_project:
         logs = [log for log in logs if log.get("project_id") == log_project]
     if log_version:
         logs = [log for log in logs if log.get("version") == log_version]
 
+    detail_build = next((build for build in builds if build["id"] == request.args.get("build")), None)
+    detail_log = next((log for log in logs if log["id"] == request.args.get("log")), None)
+    related_logs = [log for log in logs if detail_build and log.get("build_id") in {detail_build["id"], detail_build.get("build_code")}]
+    titles = {"dashboard": "Dashboard", "projects": "Projects", "builds": "Builds", "logs": "Logs", "upload": "Upload build", "build": "Build details", "log": "Log details"}
+    subtitles = {"dashboard": "Builds and test evidence, in one place.", "projects": "Manage projects and their test context.", "builds": "Every version, ready for the next test.", "logs": "Inspect evidence from launcher sessions.", "upload": "Package, release notes, publish.", "build": "Release context and build metadata.", "log": "Session details and uploaded evidence."}
     return render_template(
         "index.html",
+        title=titles[view], subtitle=subtitles[view],
+        detail_build=detail_build, detail_log=detail_log, related_logs=related_logs,
         user=user,
         users=users,
         projects=projects,
         selected_project=selected_project,
         builds=builds,
         latest_build=latest_build,
-        channels=CHANNELS,
+        channels=[channel for channel in CHANNELS if can_assign_channel(user.get("role"), channel)],
         roles=ROLES,
         user_roles=USER_ROLES,
         build_statuses=BUILD_STATUSES,
@@ -1189,6 +1196,7 @@ def delete_log(log_id):
         demo_logs[:] = [item for item in demo_logs if item.get("id") != log_id]
     if wants_json():
         return jsonify({"id": log_id, "deleted": True})
+    flash("Log deleted")
     return redirect(url_for("index", view="logs"))
 
 
@@ -1256,6 +1264,7 @@ def update_build_changelog(build_id):
         demo_build = find_demo_build(build_id)
         if demo_build:
             demo_build.update({"changelog": changelog, "updated_at": now_iso()})
+    flash("Changelog saved")
     return redirect(url_for("index", view="builds", project=build["project_id"]))
 
 
@@ -1273,6 +1282,7 @@ def toggle_build(build_id):
         demo_build = find_demo_build(build_id)
         if demo_build:
             demo_build.update(updates)
+    flash("Build availability updated")
     return redirect(url_for("index", view="builds", project=build["project_id"]))
 
 
@@ -1287,6 +1297,7 @@ def delete_build(build_id):
     else:
         project_builds = demo_builds.get(build["project_id"], [])
         demo_builds[build["project_id"]] = [item for item in project_builds if item.get("id") != build_id]
+    flash("Build deleted")
     return redirect(url_for("index", view="builds", project=build["project_id"]))
 
 

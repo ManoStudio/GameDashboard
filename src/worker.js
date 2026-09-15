@@ -1,3 +1,6 @@
+import adminStyle from "../static/admin.css";
+import adminScript from "../static/admin-ui.js";
+import { renderAdmin } from "./admin-pages.js";
 import { MODERN_THEME_STYLE } from "./modern-theme.js";
 
 const CHANNELS = ["dev", "qa", "live", "deprecated"];
@@ -259,7 +262,7 @@ async function dashboard(request, env, user) {
   const selected = selectedId ? await getProject(env, selectedId, user) : null;
   const builds = selected ? await listBuilds(env, selected.id, user, url.origin) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
-  return html(renderDashboard({ user, projects, selected, builds, users }));
+  return html(renderAdmin({ user, projects, selected, builds, users, view: url.searchParams.get("view") || "dashboard", buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, style }));
 }
 
 async function listProjects(env, user = null) {
@@ -1141,7 +1144,7 @@ function decorateHtml(body) {
   if (!isLogin && !isDashboard) return body;
 
   let decorated = body
-    .replace("</head>", `<style>${MODERN_THEME_STYLE}</style></head>`)
+    .replace("</head>", `<style>${MODERN_THEME_STYLE}</style><style>${adminStyle}</style></head>`)
     .replace("<title>Login</title>", "<title>Login | Game Build Dashboard</title>")
     .replace("<title>Build Producer Dashboard</title>", "<title>Game Build Dashboard</title>")
     .replace("Dashboard API / R2 Storage / D1 Metadata / Role Auth", "Game build operations");
@@ -1152,13 +1155,7 @@ function decorateHtml(body) {
       `<main class="login panel">${themeToggleMarkup()}`,
     );
   }
-  if (isDashboard) {
-    decorated = decorated.replace(
-      '<div class="actions">',
-      `<div class="actions">${themeToggleMarkup()}`,
-    );
-  }
-
+  if (isDashboard) return decorated.replace("</body>", () => `<script>${adminScript}</script></body>`);
   return `${decorated}${themeScript()}`;
 }
 
@@ -1204,7 +1201,7 @@ function projectManagement(user, project, builds, latest) {
 }
 
 function uploadPanel(user, project) {
-  return `<div class="panel"><h3>Build Upload</h3><form class="form-grid" data-direct-upload="true" data-init-url="/api/projects/${project.id}/uploads/init" data-complete-base="/api/projects/${project.id}/uploads" data-return-url="/?project=${project.id}" data-loading-steps="Preparing R2 upload|Hashing files|Uploading files|Saving build"><label class="dropzone"><input type="file" name="build" multiple required><span><strong>Drop build zip here</strong><span>Files upload directly to Cloudflare R2.</span></span></label><div class="form-grid trio"><label class="field"><span class="label">Version</span><input name="version" placeholder="auto"></label><label class="field"><span class="label">Channel</span><select name="channel">${CHANNELS.filter(c => user.role === "admin" || c !== "live").map(c => `<option>${c}</option>`).join("")}</select></label><label class="field"><span class="label">Tag</span><input name="tag" placeholder="hotfix / stable"></label></div><label class="field"><span class="label">Changelog</span><textarea name="changelog"></textarea></label><button class="button">Upload Build</button></form></div>`;
+  return `<div class="panel"><h3>Build Upload</h3><form class="form-grid" data-direct-upload="true" data-init-url="/api/projects/${project.id}/uploads/init" data-complete-base="/api/projects/${project.id}/uploads" data-return-url="/?view=builds&project=${project.id}" data-loading-steps="Preparing R2 upload|Hashing files|Uploading files|Saving build"><label class="dropzone"><input type="file" name="build" multiple required><span><strong>Drop build zip here</strong><span>Select a build package or drop files here.</span></span></label><div class="form-grid trio"><label class="field"><span class="label">Version</span><input name="version" placeholder="auto"></label><label class="field"><span class="label">Channel</span><select name="channel">${CHANNELS.filter(c => user.role === "admin" || c !== "live").map(c => `<option>${c}</option>`).join("")}</select></label><label class="field"><span class="label">Tag</span><input name="tag" placeholder="hotfix / stable"></label></div><label class="field"><span class="label">Changelog</span><textarea name="changelog"></textarea></label><button class="button">Upload Build</button></form></div>`;
 }
 
 function userAccess(users, currentUser) {
@@ -1234,7 +1231,7 @@ function buildHistory(user, project, builds) {
 
 function buildCard(user, build) {
   const channels = CHANNELS.filter(channel => canAssign(user.role, channel));
-  return `<article class="card"><div class="build-head"><div><h3>Version ${escapeHtml(build.version)}</h3><p>${escapeHtml(build.created_at)}</p></div><div class="badges"><span class="badge ${escapeHtml(build.channel)}">${escapeHtml(build.channel)}</span>${build.tag ? `<span class="badge tag">${escapeHtml(build.tag)}</span>` : ""}<span class="badge">${escapeHtml(build.status)}</span></div></div><div class="build-meta"><div class="stat"><strong>${build.file_count}</strong><span>files</span></div><div class="stat"><strong>${(build.total_size / 1048576).toFixed(2)}</strong><span>MB</span></div><div class="stat"><strong>${escapeHtml(build.channel)}</strong><span>channel</span></div><div class="stat"><strong>${escapeHtml(build.tag || "-")}</strong><span>tag</span></div></div><p>${escapeHtml(build.changelog || "")}</p><div class="code">${escapeHtml(build.storage_path)} | ${escapeHtml(build.manifest_path)}</div><div class="split-actions">${channels.length ? `<form class="inline-form" method="post" action="/builds/${build.id}/channel" data-loading-steps="Assigning channel|Updating build status|Refreshing history"><select name="channel">${channels.map(c => `<option ${build.channel === c ? "selected" : ""}>${c}</option>`).join("")}</select><button class="icon-button">&rarr;</button></form>` : ""}<div class="actions"><a class="button secondary" href="/builds/${build.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>${user.role === "admin" ? `<form method="post" action="/builds/${build.id}/rollback" data-loading-steps="Starting rollback|Promoting build to live|Refreshing history"><button class="button secondary">Rollback</button></form>` : ""}${["admin", "dev"].includes(user.role) ? `<form method="post" action="/builds/${build.id}/delete" data-confirm="Delete build version ${escapeHtml(build.version)}?" data-loading-steps="Deleting build files|Removing build metadata|Refreshing history"><button class="button danger">Delete Build</button></form>` : ""}</div></div></article>`;
+  return `<article class="stack"><div class="changelog-text">${escapeHtml(build.changelog || "No changelog provided.")}</div><div class="split-actions">${channels.length ? `<form class="inline-form" method="post" action="/builds/${build.id}/channel" data-loading-steps="Assigning channel|Updating build status|Refreshing history"><select name="channel">${channels.map(c => `<option ${build.channel === c ? "selected" : ""}>${c}</option>`).join("")}</select><button class="icon-button">&rarr;</button></form>` : ""}<div class="actions"><a class="button secondary" href="/builds/${build.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>${user.role === "admin" ? `<form method="post" action="/builds/${build.id}/rollback" data-loading-steps="Starting rollback|Promoting build to live|Refreshing history"><button class="button secondary">Rollback</button></form>` : ""}${["admin", "dev"].includes(user.role) ? `<form method="post" action="/builds/${build.id}/delete" data-confirm="Delete build version ${escapeHtml(build.version)}?" data-loading-steps="Deleting build files|Removing build metadata|Refreshing history"><button class="button danger">Delete Build</button></form>` : ""}</div></div></article>`;
 }
 
 function emptyView() {

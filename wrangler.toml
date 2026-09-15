@@ -19,3 +19,8 @@ LAUNCHER_BUNDLE_ID = "com.manostudio.launcher"
 # Cloudflare dashboard -> Workers & Pages -> Overview, or the account id in your deploy log URL.
 R2_ACCOUNT_ID = "4956abaf4d499cde396a8c7ebf6061c6"
 R2_PUBLIC_URL = ""
+
+[[rules]]
+type = "Text"
+globs = ["**/*.css", "**/admin-ui.js"]
+fallthrough = true
