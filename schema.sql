@@ -38,10 +38,14 @@ CREATE TABLE IF NOT EXISTS builds (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
   version TEXT NOT NULL,
+  build_code TEXT,
+  platform TEXT NOT NULL DEFAULT 'Windows',
+  build_date TEXT,
   channel TEXT NOT NULL,
   tag TEXT,
   changelog TEXT,
   status TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
   commit_sha TEXT,
   uploaded_by TEXT,
   uploaded_at TEXT,
@@ -63,6 +67,22 @@ CREATE TABLE IF NOT EXISTS builds (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS logs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  build_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  machine_name TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  file_url TEXT,
+  metadata_json TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_builds_project_created ON builds(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_project_uploaded ON logs(project_id, uploaded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_build_version ON logs(build_id, version);
 CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email);

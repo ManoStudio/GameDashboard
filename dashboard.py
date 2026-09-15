@@ -28,7 +28,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 app.secret_key = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or "change-me-in-vercel"
 
-CHANNELS = ["dev", "qa", "live", "deprecated"]
+CHANNELS = ["dev", "qa", "stable"]
 ROLES = ["admin", "dev", "QA"]
 USER_ROLES = ["admin", "dev", "QA", "viewer"]
 BUILD_STATUSES = ["uploaded", "manifest-ready", "stored", "assigned"]
@@ -216,6 +216,8 @@ def can_assign_channel(role, channel):
 
 def normalize_channel(channel, fallback="dev"):
     normalized = str(channel or fallback).strip().lower()
+    if normalized == "live":
+        normalized = "stable"
     return normalized if normalized in CHANNELS else fallback
 
 
@@ -256,21 +258,21 @@ def seed_projects():
     return [
         {
             "id": "project-demo-racer",
-            "name": "Neon Drift",
-            "icon": "ND",
-            "bundle_id": "com.mano.neondrift",
+            "name": "Scrap N Blood",
+            "icon": "SN",
+            "bundle_id": "com.mano.scrapnblood",
             "role": "admin",
             "banner_title": "Neon Drift",
-            "banner_subtitle": "Initial QA candidate is ready to test.",
-            "description": "Arcade drift build for launcher smoke testing.",
+            "banner_subtitle": "Internal combat test build for the next QA pass.",
+            "description": "Standalone combat build for launcher regression testing.",
             "cover_url": "",
-            "known_issues": json.dumps(["Controller remap needs another QA pass"]),
-            "test_instructions": "Focus on launch, login, and one complete race.",
-            "focus_areas": json.dumps(["Focus Test", "Input", "Patch Flow"]),
+            "known_issues": json.dumps(["Boss may freeze after Host disconnects"]),
+            "test_instructions": "Boss Multiplayer Behavior\nSprint Synchronization\nWeapon Holster Fix",
+            "focus_areas": json.dumps(["Boss Multiplayer Behavior", "Sprint Synchronization", "Weapon Holster Fix"]),
             "maintenance_notice": "",
             "save_path_hint": "",
             "config_path_hint": "",
-            "recommended_profile": "qa",
+            "recommended_profile": "QA Smoke",
             "created_at": now_iso(),
         },
         {
@@ -296,38 +298,83 @@ def seed_projects():
 
 
 def seed_builds(project_id):
+    prefix = "SNB" if project_id == "project-demo-racer" else "SA"
+    builds = [
+        ("125", "0.1.25", "dev", "a783c91", 2684354560, "2026-09-15T07:30:00+00:00", "Combat balance pass and new arena.", "Boss Multiplayer Behavior\nSprint Synchronization\nWeapon Holster Fix"),
+        ("124", "0.1.24", "dev", "9f2c1ab", 2576980377, "2026-09-12T07:30:00+00:00", "AI improvements and sprint replication fixes.", "Sprint Synchronization\nRegression coverage"),
+        ("120", "0.1.20", "stable", "4c1a8ef", 2469606195, "2026-08-30T07:30:00+00:00", "Stable regression baseline.", "Core stability and save migration"),
+    ]
     return [
         {
-            "id": f"{project_id}-build-100",
+            "id": f"{project_id}-build-{number}",
             "project_id": project_id,
-            "version": "1.0.0",
-            "channel": "qa",
-            "tag": "stable",
-            "changelog": "Initial QA candidate",
+            "version": version,
+            "build_code": f"{prefix}-{number}",
+            "platform": "Windows",
+            "build_date": created_at,
+            "channel": channel,
+            "tag": "stable" if channel == "stable" else "",
+            "changelog": changelog,
             "status": "assigned",
-            "commit_sha": "",
+            "enabled": True,
+            "commit_sha": commit,
             "uploaded_by": "demo",
             "uploaded_at": now_iso(),
             "manifest_id": "",
             "checksum": "",
-            "branch": "",
+            "branch": channel,
             "build_source": "demo-seed",
-            "known_issues": json.dumps([]),
-            "test_instructions": "",
-            "focus_areas": json.dumps([]),
+            "known_issues": json.dumps(["Boss may freeze after Host disconnects"] if version == "0.1.25" and project_id == "project-demo-racer" else []),
+            "test_instructions": focus,
+            "focus_areas": json.dumps(focus.splitlines()),
             "save_path_hint": "",
             "config_path_hint": "",
             "file_count": 128,
-            "total_size": 73400320,
-            "storage_path": f"/{project_id}/{project_id}-build-100/files",
-            "manifest_path": f"/{project_id}/{project_id}-build-100/manifest.json",
-            "created_at": now_iso(),
+            "total_size": size,
+            "storage_path": f"/{project_id}/{project_id}-build-{number}/files",
+            "manifest_path": f"/{project_id}/{project_id}-build-{number}/manifest.json",
+            "created_at": created_at,
         }
+        for number, version, channel, commit, size, created_at, changelog, focus in builds
     ]
 
 
 demo_projects = seed_projects()
 demo_builds = {project["id"]: seed_builds(project["id"]) for project in demo_projects}
+demo_logs = [
+    {
+        "id": "SNB-240915-004",
+        "project_id": "project-demo-racer",
+        "build_id": "project-demo-racer-build-125",
+        "version": "0.1.25",
+        "session_id": "ABC123",
+        "machine_name": "NAIL-PC",
+        "uploaded_at": "2026-09-15T07:05:00+00:00",
+        "size": 2516582,
+        "metadata": {
+            "os": "Windows 11",
+            "cpu": "AMD Ryzen 7",
+            "gpu": "NVIDIA RTX 4070",
+            "ram": "32 GB",
+        },
+    },
+    {
+        "id": "SNB-240912-002",
+        "project_id": "project-demo-racer",
+        "build_id": "project-demo-racer-build-124",
+        "version": "0.1.24",
+        "session_id": "QA-9F12",
+        "machine_name": "QA-DESK",
+        "uploaded_at": "2026-09-12T10:42:00+00:00",
+        "size": 1843200,
+        "metadata": {
+            "os": "Windows 10",
+            "cpu": "Intel Core i7",
+            "gpu": "NVIDIA RTX 3060",
+            "ram": "16 GB",
+        },
+    },
+]
 bootstrap_admin_user()
 
 
@@ -527,6 +574,9 @@ def build_payload(build):
     primary_file = files[0] if files else {}
     payload["channel"] = normalize_channel(payload.get("channel"))
     payload["build_id"] = payload.get("id", "")
+    payload["build_code"] = payload.get("build_code") or payload.get("build_id", "")
+    payload["platform"] = payload.get("platform") or "Windows"
+    payload["build_date"] = payload.get("build_date") or payload.get("created_at", "")
     payload["date"] = payload.get("created_at", "")
     payload["uploaded_at"] = payload.get("uploaded_at") or payload.get("created_at", "")
     payload["size"] = int(payload.get("total_size") or manifest.get("total_size") or 0)
@@ -540,12 +590,52 @@ def build_payload(build):
     payload["uploaded_by"] = payload.get("uploaded_by") or ""
     payload["manifest_id"] = payload.get("manifest_id") or ""
     payload["checksum"] = payload.get("checksum") or payload.get("manifest_id") or ""
+    payload["enabled"] = payload.get("enabled", payload.get("status") != "disabled")
     payload["branch"] = payload.get("branch") or ""
     payload["build_source"] = payload.get("build_source") or ""
     payload["manifest"] = manifest
     payload.setdefault("status", "")
     payload.setdefault("changelog", "")
     return payload
+
+
+def log_payload(log):
+    payload = dict(log or {})
+    payload["id"] = payload.get("id") or f"log-{uuid.uuid4().hex[:10]}"
+    payload["project_id"] = payload.get("project_id") or ""
+    payload["build_id"] = payload.get("build_id") or ""
+    payload["version"] = payload.get("version") or "Unknown"
+    payload["session_id"] = payload.get("session_id") or "Unknown"
+    payload["machine_name"] = payload.get("machine_name") or "Unknown machine"
+    payload["uploaded_at"] = payload.get("uploaded_at") or now_iso()
+    payload["size"] = int(payload.get("size") or 0)
+    payload["metadata"] = payload.get("metadata") or {}
+    project = get_project(payload["project_id"])
+    payload["project_name"] = project.get("name", payload["project_id"]) if project else payload["project_id"]
+    return payload
+
+
+def list_logs():
+    if db is None:
+        return [log_payload(log) for log in demo_logs]
+
+    try:
+        logs = db.collection("logs").order_by("uploaded_at", direction=firestore.Query.DESCENDING).stream()
+        return [log_payload(document_with_id(log)) for log in logs]
+    except google_exceptions.FailedPrecondition:
+        logs = db.collection("logs").stream()
+        return sorted(
+            [log_payload(document_with_id(log)) for log in logs],
+            key=lambda log: log.get("uploaded_at", ""),
+            reverse=True,
+        )
+
+
+def get_log(log_id):
+    if db is None:
+        return next((log_payload(log) for log in demo_logs if log.get("id") == log_id), None)
+    snapshot = db.collection("logs").document(log_id).get()
+    return log_payload(document_with_id(snapshot)) if snapshot.exists else None
 
 
 def metadata_text(source, key):
@@ -730,7 +820,7 @@ def delete_project(project_id):
 
 
 def save_build_record(project_id, form, manifest, build_id=None, version=None):
-    build_id = build_id or f"build-{uuid.uuid4().hex[:12]}"
+    internal_build_id = build_id or f"build-{uuid.uuid4().hex[:12]}"
     version = version or next_version(project_id, form.get("version", "").strip())
     channel = normalize_channel(form.get("channel", "dev"))
     now = now_iso()
@@ -740,12 +830,17 @@ def save_build_record(project_id, form, manifest, build_id=None, version=None):
     uploaded_by = form.get("uploaded_by", "").strip() or user.get("email", "")
 
     build = {
+        "id": internal_build_id,
         "project_id": project_id,
         "version": version,
+        "build_code": form.get("build_id", "").strip() or form.get("build_code", "").strip() or internal_build_id,
+        "platform": form.get("platform", "Windows").strip() or "Windows",
+        "build_date": form.get("build_date", "").strip() or now,
         "channel": channel,
         "tag": form.get("tag", "").strip(),
         "changelog": form.get("changelog", "").strip() or "Manual upload",
         "status": "assigned",
+        "enabled": True,
         "commit_sha": form.get("commit_sha", "").strip(),
         "uploaded_by": uploaded_by,
         "uploaded_at": uploaded_at,
@@ -760,8 +855,8 @@ def save_build_record(project_id, form, manifest, build_id=None, version=None):
         "config_path_hint": form.get("config_path_hint", "").strip(),
         "file_count": manifest["file_count"],
         "total_size": manifest["total_size"],
-        "storage_path": f"/{project_id}/{build_id}/files",
-        "manifest_path": f"/{project_id}/{build_id}/manifest.json",
+        "storage_path": f"/{project_id}/{internal_build_id}/files",
+        "manifest_path": f"/{project_id}/{internal_build_id}/manifest.json",
         "manifest": manifest,
         "created_at": now,
         "updated_at": now,
@@ -772,7 +867,6 @@ def save_build_record(project_id, form, manifest, build_id=None, version=None):
     else:
         demo_builds.setdefault(project_id, []).append(build)
 
-    build["id"] = build_id
     return build_payload(build)
 
 
@@ -812,12 +906,22 @@ def logout():
 @login_required
 def index():
     user = current_user()
+    view = request.args.get("view", "dashboard")
+    if view not in {"dashboard", "projects", "builds", "logs"}:
+        view = "dashboard"
     projects = list_projects()
     selected_project_id = request.args.get("project") or (projects[0]["id"] if projects else None)
     selected_project = get_project(selected_project_id) if selected_project_id else None
     builds = list_builds(selected_project_id) if selected_project_id else []
     latest_build = builds[0] if builds else None
     users = list_users() if user.get("role") == "admin" else []
+    logs = list_logs()
+    log_project = request.args.get("log_project", "").strip()
+    log_version = request.args.get("log_version", "").strip()
+    if log_project:
+        logs = [log for log in logs if log.get("project_id") == log_project]
+    if log_version:
+        logs = [log for log in logs if log.get("version") == log_version]
 
     return render_template(
         "index.html",
@@ -832,7 +936,17 @@ def index():
         user_roles=USER_ROLES,
         build_statuses=BUILD_STATUSES,
         firebase_error=firebase_error,
+        view=view,
+        logs=logs,
+        log_project=log_project,
+        log_version=log_version,
     )
+
+
+@app.route("/logs")
+@login_required
+def logs_page():
+    return redirect(url_for("index", view="logs"))
 
 
 @app.route("/projects", methods=["POST"])
@@ -994,6 +1108,90 @@ def api_project_builds(project_id):
     return jsonify(list_builds(project_id))
 
 
+@app.route("/api/logs", methods=["GET", "POST"])
+@login_required
+def api_logs():
+    if request.method == "POST":
+        if request.is_json:
+            payload = request.get_json(silent=True) or {}
+        else:
+            try:
+                payload = json.loads(request.form.get("payload", "{}"))
+            except json.JSONDecodeError:
+                return jsonify({"error": "invalid log payload"}), 400
+        project_id = str(payload.get("projectId") or payload.get("project_id") or "").strip()
+        if not project_id or not get_project(project_id):
+            return jsonify({"error": "project not found"}), 404
+        log_id = f"LOG-{datetime.now(timezone.utc).strftime('%y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+        log = {
+            "id": log_id,
+            "project_id": project_id,
+            "build_id": str(payload.get("buildId") or payload.get("build_id") or ""),
+            "version": str(payload.get("version") or "Unknown"),
+            "session_id": str(payload.get("sessionId") or payload.get("session_id") or "Unknown"),
+            "machine_name": str(payload.get("machineName") or payload.get("machine_name") or "Unknown machine"),
+            "uploaded_at": now_iso(),
+            "size": int(payload.get("size") or 0),
+            "files": payload.get("files") or [],
+            "metadata": payload.get("metadata") or {},
+            "file_url": "",
+        }
+        package = request.files.get("package")
+        if package and r2_configured():
+            object_path = f"logs/{project_id}/{log_id}/{safe_upload_name(package.filename, 1)}"
+            r2_client().upload_fileobj(
+                package.stream,
+                r2_bucket_name(),
+                object_path,
+                ExtraArgs={"ContentType": package.mimetype or "application/zip"},
+            )
+            log["storage_object"] = object_path
+            log["file_url"] = dashboard_download_url(object_path)
+        if db is not None:
+            db.collection("logs").document(log_id).set(log)
+        else:
+            demo_logs.insert(0, log)
+        return jsonify(log_payload(log)), 201
+
+    project_id = request.args.get("project", "").strip()
+    version = request.args.get("version", "").strip()
+    logs = list_logs()
+    if project_id:
+        logs = [log for log in logs if log.get("project_id") == project_id]
+    if version:
+        logs = [log for log in logs if log.get("version") == version]
+    return jsonify(logs)
+
+
+@app.route("/logs/<log_id>/download")
+@app.route("/api/logs/<log_id>/download")
+@login_required
+def download_log(log_id):
+    log = get_log(log_id)
+    if not log:
+        return jsonify({"error": "log not found"}), 404
+    file_url = log.get("file_url") or log.get("download_url")
+    if file_url:
+        return redirect(file_url)
+    return jsonify({"error": "No downloadable package is linked to this log yet."}), 404
+
+
+@app.route("/logs/<log_id>/delete", methods=["POST"])
+@app.route("/api/logs/<log_id>", methods=["DELETE"])
+@role_required("admin")
+def delete_log(log_id):
+    log = get_log(log_id)
+    if not log:
+        return jsonify({"error": "log not found"}), 404
+    if db is not None:
+        db.collection("logs").document(log_id).delete()
+    else:
+        demo_logs[:] = [item for item in demo_logs if item.get("id") != log_id]
+    if wants_json():
+        return jsonify({"id": log_id, "deleted": True})
+    return redirect(url_for("index", view="logs"))
+
+
 @app.route("/api/artifacts/<path:object_path>", methods=["GET"])
 @login_required
 def download_r2_object(object_path):
@@ -1045,6 +1243,53 @@ def update_build_channel(build_id):
     return redirect(url_for("index", project=build["project_id"]))
 
 
+@app.route("/builds/<build_id>/changelog", methods=["POST"])
+@role_required("admin", "dev")
+def update_build_changelog(build_id):
+    build = get_build(build_id)
+    if not build:
+        return jsonify({"error": "build not found"}), 404
+    changelog = request.form.get("changelog", "").strip()
+    if db is not None:
+        db.collection("builds").document(build_id).update({"changelog": changelog, "updated_at": now_iso()})
+    else:
+        demo_build = find_demo_build(build_id)
+        if demo_build:
+            demo_build.update({"changelog": changelog, "updated_at": now_iso()})
+    return redirect(url_for("index", view="builds", project=build["project_id"]))
+
+
+@app.route("/builds/<build_id>/toggle", methods=["POST"])
+@role_required("admin", "dev")
+def toggle_build(build_id):
+    build = get_build(build_id)
+    if not build:
+        return jsonify({"error": "build not found"}), 404
+    enabled = request.form.get("enabled", "false").lower() == "true"
+    updates = {"enabled": enabled, "status": "assigned" if enabled else "disabled", "updated_at": now_iso()}
+    if db is not None:
+        db.collection("builds").document(build_id).update(updates)
+    else:
+        demo_build = find_demo_build(build_id)
+        if demo_build:
+            demo_build.update(updates)
+    return redirect(url_for("index", view="builds", project=build["project_id"]))
+
+
+@app.route("/builds/<build_id>/delete", methods=["POST"])
+@role_required("admin")
+def delete_build(build_id):
+    build = get_build(build_id)
+    if not build:
+        return redirect(url_for("index", view="builds"))
+    if db is not None:
+        db.collection("builds").document(build_id).delete()
+    else:
+        project_builds = demo_builds.get(build["project_id"], [])
+        demo_builds[build["project_id"]] = [item for item in project_builds if item.get("id") != build_id]
+    return redirect(url_for("index", view="builds", project=build["project_id"]))
+
+
 @app.route("/builds/<build_id>/rollback", methods=["POST"])
 @role_required("admin")
 def rollback_build(build_id):
@@ -1054,12 +1299,12 @@ def rollback_build(build_id):
 
     if db is not None:
         db.collection("builds").document(build_id).update(
-            {"channel": "live", "tag": "rollback", "updated_at": now_iso()}
+            {"channel": "stable", "tag": "rollback", "updated_at": now_iso()}
         )
     else:
         demo_build = find_demo_build(build_id)
         if demo_build:
-            demo_build.update({"channel": "live", "tag": "rollback", "updated_at": now_iso()})
+            demo_build.update({"channel": "stable", "tag": "rollback", "updated_at": now_iso()})
 
     return redirect(url_for("index", project=build["project_id"]))
 
