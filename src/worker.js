@@ -12,9 +12,11 @@ const encoder = new TextEncoder();
 export default {
   async fetch(request, env) {
     try {
-      await ensureSchema(env);
-      await bootstrapAdmin(env);
       const url = new URL(request.url);
+      // Schema is managed by D1 migrations. Bootstrap only when someone signs in.
+      if (request.method === "POST" && (url.pathname === "/login" || url.pathname === "/api/auth/login")) {
+        await bootstrapAdmin(env);
+      }
       const user = await currentUser(request, env);
       const route = await dispatch(request, env, url, user);
       return route || notFound();
@@ -23,104 +25,6 @@ export default {
     }
   },
 };
-
-async function ensureSchema(env) {
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS users (
-      email TEXT PRIMARY KEY,
-      role TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY,
-      email TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS projects (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      icon TEXT NOT NULL,
-      bundle_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      banner_title TEXT,
-      banner_subtitle TEXT,
-      description TEXT,
-      cover_url TEXT,
-      known_issues TEXT,
-      test_instructions TEXT,
-      focus_areas TEXT,
-      maintenance_notice TEXT,
-      save_path_hint TEXT,
-      config_path_hint TEXT,
-      recommended_profile TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS builds (
-      id TEXT PRIMARY KEY,
-      project_id TEXT NOT NULL,
-      version TEXT NOT NULL,
-      channel TEXT NOT NULL,
-      tag TEXT,
-      changelog TEXT,
-      status TEXT NOT NULL,
-      commit_sha TEXT,
-      uploaded_by TEXT,
-      uploaded_at TEXT,
-      manifest_id TEXT,
-      checksum TEXT,
-      branch TEXT,
-      build_source TEXT,
-      known_issues TEXT,
-      test_instructions TEXT,
-      focus_areas TEXT,
-      save_path_hint TEXT,
-      config_path_hint TEXT,
-      file_count INTEGER NOT NULL,
-      total_size INTEGER NOT NULL,
-      storage_path TEXT NOT NULL,
-      manifest_path TEXT NOT NULL,
-      manifest_json TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`,
-    "CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_builds_project_created ON builds(project_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email)",
-  ];
-
-  for (const statement of statements) {
-    await env.DB.prepare(statement).run();
-  }
-
-  const projectColumns = [
-    "banner_title", "banner_subtitle", "description", "cover_url",
-    "known_issues", "test_instructions", "focus_areas", "maintenance_notice",
-    "save_path_hint", "config_path_hint", "recommended_profile",
-  ];
-  const buildColumns = [
-    "commit_sha", "uploaded_by", "uploaded_at", "manifest_id", "checksum",
-    "branch", "build_source", "known_issues", "test_instructions",
-    "focus_areas", "save_path_hint", "config_path_hint",
-  ];
-  for (const column of projectColumns) {
-    try {
-      await env.DB.prepare(`ALTER TABLE projects ADD COLUMN ${column} TEXT`).run();
-    } catch (error) {
-      if (!String(error.message || error).includes("duplicate column name")) throw error;
-    }
-  }
-  for (const column of buildColumns) {
-    try {
-      await env.DB.prepare(`ALTER TABLE builds ADD COLUMN ${column} TEXT`).run();
-    } catch (error) {
-      if (!String(error.message || error).includes("duplicate column name")) throw error;
-    }
-  }
-}
 
 async function dispatch(request, env, url, user) {
   const path = url.pathname;
@@ -132,7 +36,9 @@ async function dispatch(request, env, url, user) {
   if (path === "/api/auth/login" && method === "POST") return loginJson(request, env);
   if (path === "/api/auth/logout" && method === "POST") return logoutJson(request, env);
   if (path === "/api/me" && method === "GET") return requireLogin(user, true) || json({ user: describeUser(user) });
+  if (path === "/api/launcher/library" && method === "GET") return requireLogin(user, true) || json(await launcherLibrary(env, user));
   if (path === "/api/launcher/latest" && method === "GET") return launcherLatest(request, env);
+  if (path === "/api/launcher/installer" && method === "GET") return launcherInstaller(env);
   if (path === "/api/launcher/history" && method === "GET") return launcherHistory(request, env);
   if (path === "/" && method === "GET") return requireLogin(user) || dashboard(request, env, user);
 
@@ -293,6 +199,43 @@ async function listBuilds(env, projectId, user = null, baseUrl = "") {
   const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
   const visibleChannels = new Set(visibleChannelsForRole(user?.role));
   return Promise.all((results || []).filter(row => visibleChannels.has(normalizeChannel(row.channel))).map(row => rowToBuild(env, row, baseUrl)));
+}
+
+async function launcherLibrary(env, user) {
+  const projects = await listProjects(env, user);
+  const allowed = new Set(projects.map(project => project.id));
+  const channels = new Set(visibleChannelsForRole(user.role));
+  const { results } = await env.DB.prepare("SELECT * FROM builds ORDER BY created_at DESC").all();
+  const buildsByProject = new Map(projects.map(project => [project.id, []]));
+  for (const row of results || []) {
+    if (!allowed.has(row.project_id) || !channels.has(normalizeChannel(row.channel))) continue;
+    buildsByProject.get(row.project_id).push(rowToLauncherSummary(row));
+  }
+  return projects.map(project => ({ ...project, builds: buildsByProject.get(project.id) }));
+}
+
+function rowToLauncherSummary(row) {
+  const manifest = row.manifest_json ? JSON.parse(row.manifest_json) : {};
+  return {
+    id: row.id,
+    version: row.version,
+    channel: normalizeChannel(row.channel),
+    status: row.status,
+    build_code: row.build_code,
+    platform: row.platform,
+    branch: row.branch,
+    commit: row.commit_sha,
+    date: row.created_at,
+    size: Number(row.total_size || manifest.total_size || 0),
+    changelog: row.changelog,
+    test_instructions: row.test_instructions,
+    qa_notes: row.qa_notes,
+    focus_areas: row.focus_areas,
+    known_issues: row.known_issues,
+    manifest: {
+      files: (manifest.files || []).map(file => ({ path: file.path, hash: file.hash, size: file.size })),
+    },
+  };
 }
 
 async function listUsers(env) {
@@ -679,6 +622,25 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
         : [],
     },
   };
+}
+
+async function launcherInstaller(env) {
+  const latest = await env.BUILDS_BUCKET.get(env.LAUNCHER_LATEST_KEY || "launcher/latest.json");
+  if (!latest) return json({ error: "launcher release not found" }, 404);
+  const metadata = await latest.json();
+  const version = String(metadata.version || "").trim();
+  const key = String(metadata.installer_key || "").trim();
+  if (!version || key !== `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`) {
+    return json({ error: "launcher installer not found" }, 404);
+  }
+  if (!await env.BUILDS_BUCKET.head(key)) return json({ error: "launcher installer not found" }, 404);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: await presignGet(env, key),
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 async function launcherHistory(request, env) {
