@@ -587,8 +587,12 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
 
   const hasUpdate = currentVersion ? compareVersions(version, currentVersion) > 0 : true;
   const fullKey = String(metadata.full_key || "").trim();
+  const installerKey = String(metadata.installer_key || "").trim();
+  const useInstaller = installerKey === `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`;
   const patchUrl = "";
-  let fullUrl = String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
+  let fullUrl = useInstaller
+    ? await presignGet(env, installerKey)
+    : String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
   if (!fullUrl && fullKey) {
     fullUrl = await objectDownloadUrl(env, fullKey);
   }
@@ -609,8 +613,8 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
       is_mandatory: Boolean(metadata.is_mandatory),
       notes: metadata.notes || metadata.changelog || "No release notes.",
       full_url: fullUrl,
-      full_hash: metadata.full_hash || metadata.hash || "",
-      full_size: Number(metadata.full_size || metadata.size || 0),
+      full_hash: useInstaller ? (metadata.installer_hash || "") : (metadata.full_hash || metadata.hash || ""),
+      full_size: useInstaller ? Number(metadata.installer_size || 0) : Number(metadata.full_size || metadata.size || 0),
       patches: patchUrl
         ? [{
             from_version: metadata.patch_from_version || metadata.from_version || "",
