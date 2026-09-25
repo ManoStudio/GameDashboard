@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test test/*.test.js",
     "db:create": "wrangler d1 create game-dashboard-db",
     "r2:create": "wrangler r2 bucket create game-dashboard-builds",
     "dev": "wrangler dev",

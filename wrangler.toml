@@ -1,6 +1,12 @@
 name = "game-dashboard"
 main = "src/worker.js"
 compatibility_date = "2026-04-24"
+workers_dev = true
+
+[[routes]]
+pattern = "game.manostudio.app"
+zone_name = "manostudio.app"
+custom_domain = true
 
 [[d1_databases]]
 binding = "DB"
@@ -19,6 +25,11 @@ LAUNCHER_BUNDLE_ID = "com.manostudio.launcher"
 # Cloudflare dashboard -> Workers & Pages -> Overview, or the account id in your deploy log URL.
 R2_ACCOUNT_ID = "4956abaf4d499cde396a8c7ebf6061c6"
 R2_PUBLIC_URL = ""
+GOOGLE_CLIENT_ID = "745642356965-0o4saqokrmcoecom52toq0gogo5e52qb.apps.googleusercontent.com"
+GOOGLE_REDIRECT_URI = "https://game-dashboard.mano-game.workers.dev/api/auth/google/callback"
+# Keep older installed Launchers able to sign in and update during the Google rollout.
+# Remove after the updated Launcher has reached all users.
+LEGACY_PASSWORD_LOGIN_ENABLED = "true"
 
 [[rules]]
 type = "Text"
