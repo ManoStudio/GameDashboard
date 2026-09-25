@@ -26,6 +26,7 @@ LAUNCHER_BUNDLE_ID = "com.manostudio.launcher"
 # Cloudflare dashboard -> Workers & Pages -> Overview, or the account id in your deploy log URL.
 R2_ACCOUNT_ID = "4956abaf4d499cde396a8c7ebf6061c6"
 R2_PUBLIC_URL = ""
+HUB_R2_BUCKET_NAME = "mano-tools-hub-artifacts"
 GOOGLE_CLIENT_ID = "745642356965-0o4saqokrmcoecom52toq0gogo5e52qb.apps.googleusercontent.com"
 GOOGLE_REDIRECT_URI = "https://game.manostudio.app/api/auth/google/callback"
 # Keep older installed Launchers able to sign in and update during the Google rollout.

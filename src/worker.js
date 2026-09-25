@@ -504,6 +504,11 @@ async function launcherLatest(request, env) {
   const currentVersion = String(url.searchParams.get("current_version") || "").trim();
   const projectId = url.searchParams.get("project_id") || env.LAUNCHER_PROJECT_ID || "";
   const bundleId = url.searchParams.get("bundle_id") || env.LAUNCHER_BUNDLE_ID || "";
+  const hubRelease = await readHubLauncherMetadata(env, env.LAUNCHER_LATEST_KEY || "launcher/latest.json");
+  if (hubRelease) {
+    const latest = await launcherLatestFromR2(env, currentVersion, channel, hubRelease);
+    if (latest) return json(latest);
+  }
   let row = null;
 
   if (projectId) {
@@ -526,7 +531,7 @@ async function launcherLatest(request, env) {
   }
 
   if (!row) {
-    const r2Latest = await launcherLatestFromR2(env, currentVersion, channel);
+    const r2Latest = await launcherLatestFromR2(env, currentVersion, channel, hubRelease);
     if (r2Latest) return json(r2Latest);
     return json({ error: "launcher build not found", channel }, 404);
   }
@@ -565,25 +570,38 @@ async function launcherLatest(request, env) {
   });
 }
 
-async function launcherLatestFromR2(env, currentVersion, channel) {
+async function launcherLatestFromR2(env, currentVersion, channel, suppliedHubRelease) {
   const key = env.LAUNCHER_LATEST_KEY || "launcher/latest.json";
-  const object = await env.BUILDS_BUCKET.get(key);
-  if (!object) return null;
-
-  const metadata = await object.json();
+  const hubRelease = suppliedHubRelease === undefined
+    ? await readHubLauncherMetadata(env, key)
+    : suppliedHubRelease;
+  let metadata;
+  let downloadCredentials;
+  if (hubRelease) {
+    metadata = hubRelease.metadata;
+    downloadCredentials = hubRelease.credentials;
+  } else {
+    const object = await env.BUILDS_BUCKET.get(key);
+    if (!object) return null;
+    metadata = await object.json();
+  }
   const version = String(metadata.version || metadata.latest_version || "").trim();
   if (!version) return null;
 
   const hasUpdate = currentVersion ? compareVersions(version, currentVersion) > 0 : true;
   const fullKey = String(metadata.full_key || "").trim();
   const installerKey = String(metadata.installer_key || "").trim();
-  const useInstaller = installerKey === `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`;
+  const useInstaller = hubRelease
+    ? isHubLauncherArtifactKey(installerKey, version, `ManoLauncher-Setup-${version}.exe`)
+    : installerKey === `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`;
   const patchUrl = "";
   let fullUrl = useInstaller
-    ? await presignGet(env, installerKey)
+    ? await presignGet(env, installerKey, downloadCredentials)
     : String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
   if (!fullUrl && fullKey) {
-    fullUrl = await objectDownloadUrl(env, fullKey);
+    fullUrl = hubRelease && isHubLauncherArtifactKey(fullKey, version, `ManoLauncher-${version}.zip`)
+      ? await presignGet(env, fullKey, downloadCredentials)
+      : await objectDownloadUrl(env, fullKey);
   }
 
   return {
@@ -618,22 +636,79 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
 }
 
 async function launcherInstaller(env) {
-  const latest = await env.BUILDS_BUCKET.get(env.LAUNCHER_LATEST_KEY || "launcher/latest.json");
+  const key = env.LAUNCHER_LATEST_KEY || "launcher/latest.json";
+  const hubRelease = await readHubLauncherMetadata(env, key);
+  if (hubRelease) {
+    const version = String(hubRelease.metadata.version || "").trim();
+    const installerKey = String(hubRelease.metadata.installer_key || "").trim();
+    if (!version || !isHubLauncherArtifactKey(installerKey, version, `ManoLauncher-Setup-${version}.exe`)) {
+      return json({ error: "launcher installer not found" }, 404);
+    }
+    const credentials = hubRelease.credentials;
+    const headUrl = await presignR2Url(env, "HEAD", installerKey, 60, {
+      canonicalHeaders: `host:${r2Host(env)}\n`,
+      signedHeaders: "host",
+      ...credentials,
+    });
+    const exists = await fetch(headUrl, { method: "HEAD" });
+    if (!exists.ok) return json({ error: "launcher installer not found" }, exists.status === 404 ? 404 : 503);
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: await presignGet(env, installerKey, credentials),
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  const latest = await env.BUILDS_BUCKET.get(key);
   if (!latest) return json({ error: "launcher release not found" }, 404);
   const metadata = await latest.json();
   const version = String(metadata.version || "").trim();
-  const key = String(metadata.installer_key || "").trim();
-  if (!version || key !== `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`) {
+  const installerKey = String(metadata.installer_key || "").trim();
+  if (!version || installerKey !== `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`) {
     return json({ error: "launcher installer not found" }, 404);
   }
-  if (!await env.BUILDS_BUCKET.head(key)) return json({ error: "launcher installer not found" }, 404);
+  if (!await env.BUILDS_BUCKET.head(installerKey)) return json({ error: "launcher installer not found" }, 404);
   return new Response(null, {
     status: 302,
     headers: {
-      Location: await presignGet(env, key),
+      Location: await presignGet(env, installerKey),
       "Cache-Control": "no-store",
     },
   });
+}
+
+function hubR2Credentials(env) {
+  const bucketName = String(env.HUB_R2_BUCKET_NAME || "").trim();
+  const accessKeyId = String(env.HUB_R2_ACCESS_KEY_ID || "").trim();
+  const secretAccessKey = String(env.HUB_R2_SECRET_ACCESS_KEY || "").trim();
+  if (!bucketName || !accessKeyId || !secretAccessKey) return null;
+  return { bucketName, accessKeyId, secretAccessKey };
+}
+
+async function readHubLauncherMetadata(env, key) {
+  const credentials = hubR2Credentials(env);
+  if (!credentials) return null;
+  const response = await fetch(await presignGet(env, key, credentials));
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error("Hub launcher metadata could not be read");
+  const metadata = await response.json();
+  if (!metadata || typeof metadata !== "object")
+    throw new Error("Hub launcher metadata is invalid");
+  return { metadata, credentials };
+}
+
+function isHubLauncherArtifactKey(key, version, filename) {
+  const parts = String(key || "").split("/");
+  return (
+    parts.length === 5 &&
+    parts[0] === "artifacts" &&
+    parts[1] === "mano-launcher" &&
+    parts[2] === version &&
+    /^[0-9a-f-]{36}$/.test(parts[3]) &&
+    parts[4] === filename
+  );
 }
 
 async function launcherHistory(request, env) {
@@ -903,21 +978,27 @@ async function presignPut(env, key, contentType) {
   });
 }
 
-async function presignGet(env, key) {
+async function presignGet(env, key, credentials = {}) {
   return presignR2Url(env, "GET", key, 3600, {
     canonicalHeaders: `host:${r2Host(env)}\n`,
     signedHeaders: "host",
+    ...credentials,
   });
 }
 
 async function presignR2Url(env, method, key, expires, options) {
   const host = r2Host(env);
-  const path = r2Path(env, key);
+  const bucketName = options.bucketName || env.R2_BUCKET_NAME;
+  const accessKeyId = options.accessKeyId || env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = options.secretAccessKey || env.R2_SECRET_ACCESS_KEY;
+  if (!bucketName || !accessKeyId || !secretAccessKey)
+    throw new Error("R2 signing credentials are not configured");
+  const path = r2Path(env, key, bucketName);
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
   const dateStamp = amzDate.slice(0, 8);
   const credentialScope = `${dateStamp}/auto/s3/aws4_request`;
-  const credential = `${env.R2_ACCESS_KEY_ID}/${credentialScope}`;
+  const credential = `${accessKeyId}/${credentialScope}`;
   const params = new URLSearchParams({
     "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
     "X-Amz-Credential": credential,
@@ -928,7 +1009,7 @@ async function presignR2Url(env, method, key, expires, options) {
   const canonicalQuery = [...params.entries()].map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).sort().join("&");
   const canonicalRequest = [method, path, canonicalQuery, options.canonicalHeaders, options.signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
   const stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, await sha256Hex(canonicalRequest)].join("\n");
-  const signingKey = await signatureKey(env.R2_SECRET_ACCESS_KEY, dateStamp, "auto", "s3");
+  const signingKey = await signatureKey(secretAccessKey, dateStamp, "auto", "s3");
   const signature = await hmacHex(signingKey, stringToSign);
   return `https://${host}${path}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
@@ -937,8 +1018,8 @@ function r2Host(env) {
   return `${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
 }
 
-function r2Path(env, key) {
-  return `/${env.R2_BUCKET_NAME}/${encodeURIComponent(key).replaceAll("%2F", "/")}`;
+function r2Path(env, key, bucketName = env.R2_BUCKET_NAME) {
+  return `/${bucketName}/${encodeURIComponent(key).replaceAll("%2F", "/")}`;
 }
 
 async function manifestWithDownloadUrls(env, manifest, baseUrl = "") {
