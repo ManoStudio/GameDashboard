@@ -2,6 +2,7 @@ name = "game-dashboard"
 main = "src/worker.js"
 compatibility_date = "2026-04-24"
 workers_dev = true
+preview_urls = false
 
 [[routes]]
 pattern = "game.manostudio.app"
