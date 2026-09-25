@@ -2,6 +2,7 @@ import adminStyle from "../static/admin.css";
 import adminScript from "../static/admin-ui.js";
 import { renderAdmin } from "./admin-pages.js";
 import { MODERN_THEME_STYLE } from "./modern-theme.js";
+import { startGoogle, googleCallback, exchangeDesktop } from "./google-auth.js";
 
 const CHANNELS = ["dev", "qa", "live", "deprecated"];
 const USER_ROLES = ["admin", "dev", "QA", "viewer"];
@@ -14,7 +15,7 @@ export default {
     try {
       const url = new URL(request.url);
       // Schema is managed by D1 migrations. Bootstrap only when someone signs in.
-      if (request.method === "POST" && (url.pathname === "/login" || url.pathname === "/api/auth/login")) {
+      if (request.method === "GET" && url.pathname === "/api/auth/google/start") {
         await bootstrapAdmin(env);
       }
       const user = await currentUser(request, env);
@@ -30,10 +31,12 @@ async function dispatch(request, env, url, user) {
   const path = url.pathname;
   const method = request.method;
 
-  if (path === "/login" && method === "GET") return loginPage();
-  if (path === "/login" && method === "POST") return login(request, env);
+  if (path === "/login" && method === "GET") return loginPage(url.searchParams.get("error") || "");
+  if (path === "/api/auth/google/start" && method === "GET") return startGoogle(request, env);
+  if (path === "/api/auth/google/callback" && method === "GET") return googleCallback(request, env);
+  if (path === "/api/auth/desktop/exchange" && method === "POST") return exchangeDesktop(request, env);
   if (path === "/logout" && method === "POST") return logout(request, env);
-  if (path === "/api/auth/login" && method === "POST") return loginJson(request, env);
+  if (path === "/api/auth/login" && method === "POST") return env.LEGACY_PASSWORD_LOGIN_ENABLED === "true" ? loginJson(request, env) : json({ error: "Update Mano Launcher and sign in with Google." }, 410);
   if (path === "/api/auth/logout" && method === "POST") return logoutJson(request, env);
   if (path === "/api/me" && method === "GET") return requireLogin(user, true) || json({ user: describeUser(user) });
   if (path === "/api/launcher/library" && method === "GET") return requireLogin(user, true) || json(await launcherLibrary(env, user));
@@ -51,8 +54,6 @@ async function dispatch(request, env, url, user) {
   if (path === "/users" && method === "POST") return requireRole(user, "admin") || upsertUser(request, env);
   const userRole = path.match(/^\/users\/([^/]+)\/role$/);
   if (userRole && method === "POST") return requireRole(user, "admin") || updateUserRole(request, env, user, decodeURIComponent(userRole[1]));
-  const userPassword = path.match(/^\/users\/([^/]+)\/password$/);
-  if (userPassword && method === "POST") return requireRole(user, "admin") || resetUserPassword(request, env, decodeURIComponent(userPassword[1]));
   const userDelete = path.match(/^\/users\/([^/]+)\/delete$/);
   if (userDelete && method === "POST") return requireRole(user, "admin") || deleteUser(request, env, user, decodeURIComponent(userDelete[1]));
 
@@ -87,14 +88,14 @@ async function dispatch(request, env, url, user) {
 }
 
 async function bootstrapAdmin(env) {
-  if (!env.ADMIN_EMAIL || !env.ADMIN_PASSWORD) return;
+  if (!env.ADMIN_EMAIL) return;
   const email = env.ADMIN_EMAIL.trim().toLowerCase();
   const existing = await env.DB.prepare("SELECT email FROM users WHERE email = ?").bind(email).first();
   if (existing) return;
   const now = nowIso();
   await env.DB.prepare(
     "INSERT INTO users (email, role, password_hash, created_at, updated_at) VALUES (?, 'admin', ?, ?, ?)"
-  ).bind(email, await hashPassword(env.ADMIN_PASSWORD), now, now).run();
+  ).bind(email, "", now, now).run();
 }
 
 async function currentUser(request, env) {
@@ -324,18 +325,17 @@ async function upsertUser(request, env) {
   const form = await request.formData();
   const email = field(form, "email").toLowerCase();
   const role = USER_ROLES.includes(field(form, "role")) ? field(form, "role") : "viewer";
-  const password = field(form, "password");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return redirect("/?view=settings");
   const existing = await env.DB.prepare("SELECT email FROM users WHERE email = ?").bind(email).first();
   const now = nowIso();
-  if (!existing && !password) return redirect("/");
-  if (existing && !password) {
+  if (existing) {
     await env.DB.prepare("UPDATE users SET role = ?, updated_at = ? WHERE email = ?").bind(role, now, email).run();
   } else {
     await env.DB.prepare(
-      "INSERT INTO users (email, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET role = excluded.role, password_hash = excluded.password_hash, updated_at = excluded.updated_at"
-    ).bind(email, role, await hashPassword(password), now, now).run();
+      "INSERT INTO users (email, role, password_hash, created_at, updated_at) VALUES (?, ?, '', ?, ?)"
+    ).bind(email, role, now, now).run();
   }
-  return redirect("/");
+  return redirect("/?view=settings");
 }
 
 async function updateUserRole(request, env, current, email) {
@@ -343,17 +343,6 @@ async function updateUserRole(request, env, current, email) {
   const role = USER_ROLES.includes(field(form, "role")) ? field(form, "role") : "viewer";
   if (email === current.email && role !== "admin") return redirect("/");
   await env.DB.prepare("UPDATE users SET role = ?, updated_at = ? WHERE email = ?").bind(role, nowIso(), email).run();
-  return redirect("/");
-}
-
-async function resetUserPassword(request, env, email) {
-  const form = await request.formData();
-  const password = field(form, "password");
-  if (!password) return redirect("/");
-  await env.DB.prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE email = ?")
-    .bind(await hashPassword(password), nowIso(), email)
-    .run();
-  await env.DB.prepare("DELETE FROM sessions WHERE email = ?").bind(email).run();
   return redirect("/");
 }
 
@@ -587,8 +576,12 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
 
   const hasUpdate = currentVersion ? compareVersions(version, currentVersion) > 0 : true;
   const fullKey = String(metadata.full_key || "").trim();
+  const installerKey = String(metadata.installer_key || "").trim();
+  const useInstaller = installerKey === `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`;
   const patchUrl = "";
-  let fullUrl = String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
+  let fullUrl = useInstaller
+    ? await presignGet(env, installerKey)
+    : String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
   if (!fullUrl && fullKey) {
     fullUrl = await objectDownloadUrl(env, fullKey);
   }
@@ -609,8 +602,8 @@ async function launcherLatestFromR2(env, currentVersion, channel) {
       is_mandatory: Boolean(metadata.is_mandatory),
       notes: metadata.notes || metadata.changelog || "No release notes.",
       full_url: fullUrl,
-      full_hash: metadata.full_hash || metadata.hash || "",
-      full_size: Number(metadata.full_size || metadata.size || 0),
+      full_hash: useInstaller ? (metadata.installer_hash || "") : (metadata.full_hash || metadata.hash || ""),
+      full_size: useInstaller ? Number(metadata.installer_size || 0) : Number(metadata.full_size || metadata.size || 0),
       patches: patchUrl
         ? [{
             from_version: metadata.patch_from_version || metadata.from_version || "",
@@ -1142,7 +1135,7 @@ function escapeHtml(value) {
 }
 
 function loginPage(error = "") {
-  return html(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title>${style()}</head><body><main class="login panel"><div class="brand"><div class="mark">BP</div><div><h1>Build Producer</h1><p>Cloudflare dashboard</p></div></div>${error ? `<div class="alert">${escapeHtml(error)}</div>` : ""}<form method="post" class="form-grid" data-loading-steps="Checking credentials|Creating session|Opening dashboard"><label class="field"><span class="label">Email</span><input name="email" type="email" required autofocus></label><label class="field"><span class="label">Password</span><input name="password" type="password" required></label><button class="button">Login</button></form></main>${loaderScript()}</body></html>`);
+  return html(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title>${style()}</head><body><main class="login panel"><div class="brand"><div class="mark">BP</div><div><h1>Build Producer</h1><p>Cloudflare dashboard</p></div></div>${error ? `<div class="alert">${escapeHtml(error)}</div>` : ""}<p>Use a Google account that an admin has added to Dashboard access.</p><a class="button" href="/api/auth/google/start">Continue with Google</a></main></body></html>`);
 }
 
 function renderDashboard({ user, projects, selected, builds, users }) {
@@ -1167,7 +1160,7 @@ function uploadPanel(user, project) {
 }
 
 function userAccess(users, currentUser) {
-  return `<section class="panel"><div class="build-head"><div><h3>Access Control</h3><p>Manage dashboard users, roles, and password resets.</p></div></div>${permissionMatrix()}<form class="form-grid" method="post" action="/users" data-loading-steps="Creating user|Hashing password|Refreshing access list"><h3>Create User</h3><div class="form-grid trio"><label class="field"><span class="label">Email</span><input name="email" type="email" required></label><label class="field"><span class="label">Password</span><input name="password" type="password" required></label><label class="field"><span class="label">Role</span><select name="role">${USER_ROLES.map(role => `<option>${role}</option>`).join("")}</select></label></div><button class="button">Create User</button></form><div class="user-table">${users.map(u => userRow(u, currentUser)).join("")}</div></section>`;
+  return `<section class="panel"><div class="build-head"><div><h3>Access Control</h3><p>Add Google account emails and assign Dashboard roles.</p></div></div>${permissionMatrix()}<form class="form-grid" method="post" action="/users"><h3>Add Google account</h3><div class="form-grid trio"><label class="field"><span class="label">Google email</span><input name="email" type="email" required></label><label class="field"><span class="label">Role</span><select name="role">${USER_ROLES.map(role => `<option>${role}</option>`).join("")}</select></label></div><button class="button">Add user</button></form><div class="user-table">${users.map(u => userRow(u, currentUser)).join("")}</div></section>`;
 }
 
 function permissionMatrix() {
@@ -1184,7 +1177,7 @@ function userRow(accessUser, currentUser) {
   const email = escapeHtml(accessUser.email);
   const encodedEmail = encodeURIComponent(accessUser.email);
   const isSelf = accessUser.email === currentUser.email;
-  return `<article class="access-row"><div><strong>${email}</strong><span>role: ${escapeHtml(accessUser.role)}${isSelf ? " / current user" : ""}</span></div><form class="inline-form" method="post" action="/users/${encodedEmail}/role" data-loading-steps="Updating role|Refreshing access list"><select name="role">${USER_ROLES.map(role => `<option ${accessUser.role === role ? "selected" : ""} ${isSelf && role !== "admin" ? "disabled" : ""}>${role}</option>`).join("")}</select><button class="button secondary">Role</button></form><form class="inline-form" method="post" action="/users/${encodedEmail}/password" data-loading-steps="Resetting password|Clearing sessions"><input name="password" type="password" placeholder="new password" required><button class="button secondary">Reset</button></form>${isSelf ? `<button class="button secondary" disabled>Protected</button>` : `<form method="post" action="/users/${encodedEmail}/delete" data-confirm="Delete ${email}?" data-loading-steps="Deleting user|Clearing sessions|Refreshing access list"><button class="button danger">Delete</button></form>`}</article>`;
+  return `<article class="access-row"><div><strong>${email}</strong><span>role: ${escapeHtml(accessUser.role)}${isSelf ? " / current user" : ""}</span></div><form class="inline-form" method="post" action="/users/${encodedEmail}/role" data-loading-steps="Updating role|Refreshing access list"><select name="role">${USER_ROLES.map(role => `<option ${accessUser.role === role ? "selected" : ""} ${isSelf && role !== "admin" ? "disabled" : ""}>${role}</option>`).join("")}</select><button class="button secondary">Role</button></form>${isSelf ? `<button class="button secondary" disabled>Protected</button>` : `<form method="post" action="/users/${encodedEmail}/delete" data-confirm="Delete ${email}?" data-loading-steps="Deleting user|Clearing sessions|Refreshing access list"><button class="button danger">Delete</button></form>`}</article>`;
 }
 
 function buildHistory(user, project, builds) {
