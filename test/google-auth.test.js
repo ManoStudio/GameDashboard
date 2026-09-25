@@ -94,3 +94,33 @@ test("web sign-in from custom domain uses the callback domain for its state cook
   assert.equal(response.headers.get("Location"), "https://dashboard.example/api/auth/google/start");
   assert.equal(response.headers.get("Set-Cookie"), null);
 });
+
+test("web callback requires its browser state cookie and sets a Dashboard session", async () => {
+  const DB = database(new Map([["admin@example.com", { email: "admin@example.com", role: "admin", google_sub: null }]]));
+  const env = { DB, GOOGLE_CLIENT_ID: "client-id", GOOGLE_CLIENT_SECRET: "secret", GOOGLE_REDIRECT_URI: "https://dashboard.example/api/auth/google/callback" };
+  const started = await startGoogle(new Request("https://dashboard.example/api/auth/google/start"), env);
+  const state = new URL(started.headers.get("Location")).searchParams.get("state");
+  const callbackUrl = `https://dashboard.example/api/auth/google/callback?state=${state}&code=google-code`;
+  assert.equal((await googleCallback(new Request(callbackUrl), env)).status, 400);
+  const restarted = await startGoogle(new Request("https://dashboard.example/api/auth/google/start"), env);
+  const nextState = new URL(restarted.headers.get("Location")).searchParams.get("state");
+  const nonce = [...DB.flows.values()].at(-1).nonce;
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const key = publicKey.export({ format: "jwk" });
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", kid: "test-key" })).toString("base64url");
+  const claims = Buffer.from(JSON.stringify({ iss: "https://accounts.google.com", aud: env.GOOGLE_CLIENT_ID, exp: Math.floor(Date.now() / 1000) + 300, iat: Math.floor(Date.now() / 1000), nonce, email: "admin@example.com", email_verified: true, sub: "google-admin" })).toString("base64url");
+  const signature = sign("RSA-SHA256", Buffer.from(`${header}.${claims}`), privateKey).toString("base64url");
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async endpoint => endpoint.toString().includes("/token")
+    ? Response.json({ id_token: `${header}.${claims}.${signature}` })
+    : Response.json({ keys: [{ ...key, kid: "test-key", use: "sig" }] });
+  try {
+    const callback = await googleCallback(new Request(`https://dashboard.example/api/auth/google/callback?state=${nextState}&code=google-code`, { headers: { Cookie: `oauth_state=${nextState}` } }), env);
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get("Location"), "/");
+    assert.equal(callback.headers.getSetCookie().length, 2);
+    assert.equal(DB.sessions.size, 1);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
