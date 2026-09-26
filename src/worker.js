@@ -502,107 +502,33 @@ async function launcherLatest(request, env) {
   const url = new URL(request.url);
   const channel = normalizeChannel(url.searchParams.get("channel"), "live");
   const currentVersion = String(url.searchParams.get("current_version") || "").trim();
-  const projectId = url.searchParams.get("project_id") || env.LAUNCHER_PROJECT_ID || "";
-  const bundleId = url.searchParams.get("bundle_id") || env.LAUNCHER_BUNDLE_ID || "";
+  if (!hubR2Credentials(env)) {
+    return json({ error: "launcher update storage is not configured" }, 503);
+  }
   const hubRelease = await readHubLauncherMetadata(env, env.LAUNCHER_LATEST_KEY || "launcher/latest.json");
-  if (hubRelease) {
-    const latest = await launcherLatestFromR2(env, currentVersion, channel, hubRelease);
-    if (latest) return json(latest);
-  }
-  let row = null;
-
-  if (projectId) {
-    row = await env.DB.prepare(
-      "SELECT * FROM builds WHERE project_id = ? AND channel = ? ORDER BY created_at DESC LIMIT 1"
-    ).bind(projectId, channel).first();
-  } else if (bundleId) {
-    row = await env.DB.prepare(
-      "SELECT builds.* FROM builds JOIN projects ON projects.id = builds.project_id WHERE projects.bundle_id = ? AND builds.channel = ? ORDER BY builds.created_at DESC LIMIT 1"
-    ).bind(bundleId, channel).first();
-  } else {
-    row = await env.DB.prepare(
-      "SELECT builds.* FROM builds JOIN projects ON projects.id = builds.project_id WHERE builds.channel = ? AND (lower(projects.name) LIKE '%launcher%' OR lower(projects.bundle_id) LIKE '%launcher%') ORDER BY builds.created_at DESC LIMIT 1"
-    ).bind(channel).first();
-    if (!row) {
-      row = await env.DB.prepare(
-        "SELECT * FROM builds WHERE channel = ? ORDER BY created_at DESC LIMIT 1"
-      ).bind(channel).first();
-    }
-  }
-
-  if (!row) {
-    const r2Latest = await launcherLatestFromR2(env, currentVersion, channel, hubRelease);
-    if (r2Latest) return json(r2Latest);
-    return json({ error: "launcher build not found", channel }, 404);
-  }
-
-  const build = await rowToBuild(env, row, url.origin);
-  const files = build?.manifest?.files || [];
-  const { full, patches } = launcherArtifacts(files, build.version);
-  const matchingPatch = currentVersion
-    ? patches.find(item => item.from_version === currentVersion && item.to_version === build.version)
-    : null;
-  const fullUrl = full?.download_url || full?.storage_url || "";
-  const patchUrl = matchingPatch?.patch_url || "";
-  const hasUpdate = currentVersion ? compareVersions(build.version, currentVersion) > 0 : true;
-  const mandatoryTag = String(build.tag || "").toLowerCase();
-  const isMandatory = mandatoryTag.includes("force") || mandatoryTag.includes("mandatory");
-
-  return json({
-    has_update: hasUpdate,
-    is_mandatory: isMandatory,
-    version: build.version,
-    from_version: matchingPatch?.from_version || "",
-    patch_url: hasUpdate ? patchUrl : "",
-    full_url: fullUrl,
-    download_url: hasUpdate ? (patchUrl || fullUrl) : "",
-    notes: build.changelog || "No release notes.",
-    channel,
-    release: {
-      version: build.version,
-      is_mandatory: isMandatory,
-      notes: build.changelog || "No release notes.",
-      full_url: fullUrl,
-      full_hash: full?.hash || "",
-      full_size: Number(full?.size || 0),
-      patches,
-    },
-  });
+  if (!hubRelease) return json({ error: "launcher release not found", channel }, 404);
+  const latest = await launcherLatestFromHub(env, currentVersion, channel, hubRelease);
+  if (!latest) return json({ error: "launcher release artifacts not found", channel }, 404);
+  return json(latest);
 }
 
-async function launcherLatestFromR2(env, currentVersion, channel, suppliedHubRelease) {
-  const key = env.LAUNCHER_LATEST_KEY || "launcher/latest.json";
-  const hubRelease = suppliedHubRelease === undefined
-    ? await readHubLauncherMetadata(env, key)
-    : suppliedHubRelease;
-  let metadata;
-  let downloadCredentials;
-  if (hubRelease) {
-    metadata = hubRelease.metadata;
-    downloadCredentials = hubRelease.credentials;
-  } else {
-    const object = await env.BUILDS_BUCKET.get(key);
-    if (!object) return null;
-    metadata = await object.json();
-  }
+async function launcherLatestFromHub(env, currentVersion, channel, hubRelease) {
+  const metadata = hubRelease.metadata;
+  const downloadCredentials = hubRelease.credentials;
   const version = String(metadata.version || metadata.latest_version || "").trim();
   if (!version) return null;
+  const hubToolSlug = hubLauncherToolSlug(metadata);
+  if (!hubToolSlug) return null;
 
   const hasUpdate = currentVersion ? compareVersions(version, currentVersion) > 0 : true;
   const fullKey = String(metadata.full_key || "").trim();
   const installerKey = String(metadata.installer_key || "").trim();
-  const useInstaller = hubRelease
-    ? isHubLauncherArtifactKey(installerKey, version, `ManoLauncher-Setup-${version}.exe`)
-    : installerKey === `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`;
+  const useInstaller = isHubLauncherArtifactKey(installerKey, version, `ManoLauncher-Setup-${version}.exe`, hubToolSlug);
+  const useFullArchive = isHubLauncherArtifactKey(fullKey, version, `ManoLauncher-${version}.zip`, hubToolSlug);
+  if (!useInstaller && !useFullArchive) return null;
   const patchUrl = "";
-  let fullUrl = useInstaller
-    ? await presignGet(env, installerKey, downloadCredentials)
-    : String(metadata.download_url || metadata.full_url || metadata.url || "").trim();
-  if (!fullUrl && fullKey) {
-    fullUrl = hubRelease && isHubLauncherArtifactKey(fullKey, version, `ManoLauncher-${version}.zip`)
-      ? await presignGet(env, fullKey, downloadCredentials)
-      : await objectDownloadUrl(env, fullKey);
-  }
+  const artifactKey = useInstaller ? installerKey : fullKey;
+  const fullUrl = await presignGet(env, artifactKey, downloadCredentials);
 
   return {
     has_update: hasUpdate,
@@ -614,7 +540,7 @@ async function launcherLatestFromR2(env, currentVersion, channel, suppliedHubRel
     download_url: hasUpdate ? fullUrl : "",
     notes: metadata.notes || metadata.changelog || "No release notes.",
     channel,
-    source: "r2_latest_json",
+    source: "mano_tools_hub_r2",
     release: {
       version,
       is_mandatory: Boolean(metadata.is_mandatory),
@@ -637,43 +563,29 @@ async function launcherLatestFromR2(env, currentVersion, channel, suppliedHubRel
 
 async function launcherInstaller(env) {
   const key = env.LAUNCHER_LATEST_KEY || "launcher/latest.json";
-  const hubRelease = await readHubLauncherMetadata(env, key);
-  if (hubRelease) {
-    const version = String(hubRelease.metadata.version || "").trim();
-    const installerKey = String(hubRelease.metadata.installer_key || "").trim();
-    if (!version || !isHubLauncherArtifactKey(installerKey, version, `ManoLauncher-Setup-${version}.exe`)) {
-      return json({ error: "launcher installer not found" }, 404);
-    }
-    const credentials = hubRelease.credentials;
-    const headUrl = await presignR2Url(env, "HEAD", installerKey, 60, {
-      canonicalHeaders: `host:${r2Host(env)}\n`,
-      signedHeaders: "host",
-      ...credentials,
-    });
-    const exists = await fetch(headUrl, { method: "HEAD" });
-    if (!exists.ok) return json({ error: "launcher installer not found" }, exists.status === 404 ? 404 : 503);
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: await presignGet(env, installerKey, credentials),
-        "Cache-Control": "no-store",
-      },
-    });
+  if (!hubR2Credentials(env)) {
+    return json({ error: "launcher update storage is not configured" }, 503);
   }
-
-  const latest = await env.BUILDS_BUCKET.get(key);
-  if (!latest) return json({ error: "launcher release not found" }, 404);
-  const metadata = await latest.json();
-  const version = String(metadata.version || "").trim();
-  const installerKey = String(metadata.installer_key || "").trim();
-  if (!version || installerKey !== `launcher/releases/${version}/ManoLauncher-Setup-${version}.exe`) {
+  const hubRelease = await readHubLauncherMetadata(env, key);
+  if (!hubRelease) return json({ error: "launcher release not found" }, 404);
+  const version = String(hubRelease.metadata.version || "").trim();
+  const installerKey = String(hubRelease.metadata.installer_key || "").trim();
+  const hubToolSlug = hubLauncherToolSlug(hubRelease.metadata);
+  if (!version || !hubToolSlug || !isHubLauncherArtifactKey(installerKey, version, `ManoLauncher-Setup-${version}.exe`, hubToolSlug)) {
     return json({ error: "launcher installer not found" }, 404);
   }
-  if (!await env.BUILDS_BUCKET.head(installerKey)) return json({ error: "launcher installer not found" }, 404);
+  const credentials = hubRelease.credentials;
+  const headUrl = await presignR2Url(env, "HEAD", installerKey, 60, {
+    canonicalHeaders: `host:${r2Host(env)}\n`,
+    signedHeaders: "host",
+    ...credentials,
+  });
+  const exists = await fetch(headUrl, { method: "HEAD" });
+  if (!exists.ok) return json({ error: "launcher installer not found" }, exists.status === 404 ? 404 : 503);
   return new Response(null, {
     status: 302,
     headers: {
-      Location: await presignGet(env, installerKey),
+      Location: await presignGet(env, installerKey, credentials),
       "Cache-Control": "no-store",
     },
   });
@@ -699,12 +611,20 @@ async function readHubLauncherMetadata(env, key) {
   return { metadata, credentials };
 }
 
-function isHubLauncherArtifactKey(key, version, filename) {
+const HUB_LAUNCHER_TOOL_SLUGS = new Set(["mano-launcher", "gamelauncher"]);
+
+function hubLauncherToolSlug(metadata) {
+  const slug = String(metadata.tool_slug || "mano-launcher").trim();
+  return HUB_LAUNCHER_TOOL_SLUGS.has(slug) ? slug : "";
+}
+
+function isHubLauncherArtifactKey(key, version, filename, toolSlug) {
   const parts = String(key || "").split("/");
   return (
+    HUB_LAUNCHER_TOOL_SLUGS.has(toolSlug) &&
     parts.length === 5 &&
     parts[0] === "artifacts" &&
-    parts[1] === "mano-launcher" &&
+    parts[1] === toolSlug &&
     parts[2] === version &&
     /^[0-9a-f-]{36}$/.test(parts[3]) &&
     parts[4] === filename

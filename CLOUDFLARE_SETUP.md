@@ -65,7 +65,7 @@ npx wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.toml
 
 Set `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and optional `R2_PUBLIC_URL` in `wrangler.toml`.
 
-The Launcher update endpoint also reads releases from the private Mano Tools Hub artifact bucket. Create a separate Cloudflare R2 API token with **Object Read only** permission scoped only to `mano-tools-hub-artifacts`, then configure its Access Key ID and Secret Access Key as `HUB_R2_ACCESS_KEY_ID` and `HUB_R2_SECRET_ACCESS_KEY` Worker secrets. `HUB_R2_BUCKET_NAME` is configured in `wrangler.toml`. Keep the existing `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` scoped to `game-dashboard-builds` for game build uploads.
+The Launcher update endpoints read releases exclusively from the private Mano Tools Hub artifact bucket; they return an error if the Hub manifest or its artifacts are unavailable. Create a separate Cloudflare R2 API token with **Object Read only** permission scoped only to `mano-tools-hub-artifacts`, then configure its Access Key ID and Secret Access Key as `HUB_R2_ACCESS_KEY_ID` and `HUB_R2_SECRET_ACCESS_KEY` Worker secrets. `HUB_R2_BUCKET_NAME` is configured in `wrangler.toml`. Keep the existing `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` scoped to `game-dashboard-builds` for Game Dashboard project builds.
 
 Create the read-only token under **R2 → Manage R2 API Tokens**. Cloudflare's [R2 token guide](https://developers.cloudflare.com/r2/api/tokens/) documents bucket scoping and the **Object Read only** permission.
 
