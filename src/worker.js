@@ -1161,7 +1161,7 @@ function uploadPanel(user, project) {
 }
 
 function userAccess(users, currentUser) {
-  return `<section class="panel"><div class="build-head"><div><h3>Access Control</h3><p>Add Google account emails and assign Dashboard roles.</p></div></div>${permissionMatrix()}<form class="form-grid" method="post" action="/users"><h3>Add Google account</h3><div class="form-grid trio"><label class="field"><span class="label">Google email</span><input name="email" type="email" required></label><label class="field"><span class="label">Role</span><select name="role">${USER_ROLES.map(role => `<option>${role}</option>`).join("")}</select></label></div><button class="button">Add user</button></form><div class="user-table">${users.map(u => userRow(u, currentUser)).join("")}</div></section>`;
+  return `<section class="panel access-control"><div class="build-head"><div><h3>Access Control</h3><p>Add Google account emails and assign Dashboard roles.</p></div></div>${permissionMatrix()}<form class="form-grid" method="post" action="/users"><h3>Add Google account</h3><div class="form-grid trio"><label class="field"><span class="label">Google email</span><input name="email" type="email" required></label><label class="field"><span class="label">Role</span><select name="role">${USER_ROLES.map(role => `<option>${role}</option>`).join("")}</select></label></div><button class="button">Add user</button></form><div class="user-table">${users.map(u => userRow(u, currentUser)).join("")}</div></section>`;
 }
 
 function permissionMatrix() {
