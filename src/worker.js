@@ -527,7 +527,9 @@ async function launcherLatestFromHub(env, currentVersion, channel, hubRelease) {
   const useFullArchive = isHubLauncherArtifactKey(fullKey, version, `ManoLauncher-${version}.zip`, hubToolSlug);
   if (!useInstaller && !useFullArchive) return null;
   const patchUrl = "";
-  const artifactKey = useInstaller ? installerKey : fullKey;
+  // The full ZIP can replace the packaged app directly after it exits. Keep
+  // the installer endpoint for fresh installs and older release manifests.
+  const artifactKey = useFullArchive ? fullKey : installerKey;
   const fullUrl = await presignGet(env, artifactKey, downloadCredentials);
 
   return {
@@ -546,8 +548,8 @@ async function launcherLatestFromHub(env, currentVersion, channel, hubRelease) {
       is_mandatory: Boolean(metadata.is_mandatory),
       notes: metadata.notes || metadata.changelog || "No release notes.",
       full_url: fullUrl,
-      full_hash: useInstaller ? (metadata.installer_hash || "") : (metadata.full_hash || metadata.hash || ""),
-      full_size: useInstaller ? Number(metadata.installer_size || 0) : Number(metadata.full_size || metadata.size || 0),
+      full_hash: useFullArchive ? (metadata.full_hash || metadata.hash || "") : (metadata.installer_hash || ""),
+      full_size: useFullArchive ? Number(metadata.full_size || metadata.size || 0) : Number(metadata.installer_size || 0),
       patches: patchUrl
         ? [{
             from_version: metadata.patch_from_version || metadata.from_version || "",
