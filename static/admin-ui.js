@@ -61,8 +61,8 @@ function initAdmin() {
     const statuses = [...new Set(rows.map(row => row.dataset.status).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     const channel = addFilter('Channel', 'Channels', channels, value => ({ dev: 'Development', qa: 'QA', live: 'Live', stable: 'Stable', deprecated: 'Deprecated' }[value.toLowerCase()] || value));
     const status = addFilter('Status', 'Statuses', statuses, value => value === 'ready' ? 'Ready' : value.charAt(0).toUpperCase() + value.slice(1));
-    const sort = document.createElement('select'); sort.setAttribute('aria-label', 'Sort builds');
-    [['newest', 'Newest'], ['oldest', 'Oldest'], ['version-asc', 'Version: low to high'], ['version-desc', 'Version: high to low'], ['size-asc', 'Size: small to large'], ['size-desc', 'Size: large to small']].forEach(([value, label]) => sort.add(new Option(label, value)));
+    const sort = document.createElement('select'); sort.setAttribute('aria-label', 'Sort builds by date or name');
+    [['date-desc', 'Date: newest first'], ['date-asc', 'Date: oldest first'], ['name-asc', 'Name: A–Z'], ['name-desc', 'Name: Z–A']].forEach(([value, label]) => sort.add(new Option(label, value)));
     toolbar.append(sort); surface.insertBefore(toolbar, wrap);
     const summary = document.createElement('div'); summary.className = 'build-result-summary'; summary.setAttribute('role', 'status'); summary.setAttribute('aria-live', 'polite'); surface.insertBefore(summary, wrap);
     const pager = document.createElement('div'); pager.className = 'pager build-pager';
@@ -77,15 +77,13 @@ function initAdmin() {
       const matching = indexed.filter(item => (!query || item.text.includes(query)) && (!channel.value || item.row.dataset.channel === channel.value) && (!status.value || item.row.dataset.status === status.value));
       matching.sort((a, b) => {
         let order = 0;
-        if (sort.value === 'oldest') order = a.date - b.date;
-        else if (sort.value === 'version-asc') order = versionOrder.compare(a.version, b.version);
-        else if (sort.value === 'version-desc') order = versionOrder.compare(b.version, a.version);
-        else if (sort.value === 'size-asc') order = a.size - b.size;
-        else if (sort.value === 'size-desc') order = b.size - a.size;
+        if (sort.value === 'date-asc') order = a.date - b.date;
+        else if (sort.value === 'name-asc') order = versionOrder.compare(a.version, b.version);
+        else if (sort.value === 'name-desc') order = versionOrder.compare(b.version, a.version);
         else order = b.date - a.date;
         return order || a.index - b.index;
       });
-      const active = !!query || !!channel.value || !!status.value || sort.value !== 'newest';
+      const active = !!query || !!channel.value || !!status.value || sort.value !== 'date-desc';
       const pages = Math.max(1, Math.ceil(matching.length / pageSize)); page = Math.min(Math.max(0, page), pages - 1);
       const visible = active ? matching.slice(page * pageSize, (page + 1) * pageSize) : matching.slice(0, pageSize);
       body.replaceChildren(...visible.map(item => item.row));
