@@ -31,3 +31,10 @@ td{white-space:nowrap}td.mono{max-width:180px;overflow:hidden;text-overflow:elli
   .user-table .access-row > .button:last-child{width:100%}
 }
 :root[data-theme=light] .access-control > form > .button{color:#fff}
+
+.build-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) repeat(3,minmax(120px,.45fr));align-items:center}
+.build-toolbar input,.build-toolbar select{width:100%;min-width:0;min-height:34px}
+.build-toolbar input{flex:none}
+.build-result-summary{padding:0 16px 8px;color:var(--muted);font-size:11px}
+.build-pager[hidden]{display:none}
+@media(max-width:760px){.build-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.build-toolbar input,.build-toolbar select:last-of-type{grid-column:1/-1}}

@@ -47,6 +47,59 @@ function initAdmin() {
     if (!confirm(form.dataset.confirm)) event.preventDefault();
   }));
 
+  $$('table[data-build-tools]').forEach(table => {
+    const body = table.tBodies[0]; const rows = Array.from(body.rows).filter(row => !row.querySelector('[colspan]'));
+    if (!rows.length) return;
+    const surface = table.closest('.surface,.panel'); const wrap = table.closest('.table-wrap');
+    const toolbar = document.createElement('div'); toolbar.className = 'toolbar build-toolbar'; toolbar.setAttribute('role', 'search'); toolbar.setAttribute('aria-label', 'Search all builds');
+    const search = document.createElement('input'); search.className = 'build-search'; search.type = 'search'; search.placeholder = 'Search all builds…'; search.setAttribute('aria-label', 'Search all builds by version, build ID, or commit'); toolbar.append(search);
+    const addFilter = (key, label, values, format = value => value) => {
+      const select = document.createElement('select'); select.setAttribute('aria-label', 'Filter builds by ' + key.toLowerCase()); select.add(new Option('All ' + label.toLowerCase(), ''));
+      values.forEach(value => select.add(new Option(format(value), value))); toolbar.append(select); return select;
+    };
+    const channels = [...new Set(rows.map(row => row.dataset.channel).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    const statuses = [...new Set(rows.map(row => row.dataset.status).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    const channel = addFilter('Channel', 'Channels', channels, value => ({ dev: 'Development', qa: 'QA', live: 'Live', stable: 'Stable', deprecated: 'Deprecated' }[value.toLowerCase()] || value));
+    const status = addFilter('Status', 'Statuses', statuses, value => value === 'ready' ? 'Ready' : value.charAt(0).toUpperCase() + value.slice(1));
+    const sort = document.createElement('select'); sort.setAttribute('aria-label', 'Sort builds');
+    [['newest', 'Newest'], ['oldest', 'Oldest'], ['version-asc', 'Version: low to high'], ['version-desc', 'Version: high to low'], ['size-asc', 'Size: small to large'], ['size-desc', 'Size: large to small']].forEach(([value, label]) => sort.add(new Option(label, value)));
+    toolbar.append(sort); surface.insertBefore(toolbar, wrap);
+    const summary = document.createElement('div'); summary.className = 'build-result-summary'; summary.setAttribute('role', 'status'); summary.setAttribute('aria-live', 'polite'); surface.insertBefore(summary, wrap);
+    const pager = document.createElement('div'); pager.className = 'pager build-pager';
+    const count = document.createElement('span'); const actions = document.createElement('div'); actions.className = 'actions';
+    const previous = document.createElement('button'); previous.className = 'btn secondary small'; previous.type = 'button'; previous.textContent = 'Previous'; previous.setAttribute('aria-label', 'Previous build results');
+    const next = document.createElement('button'); next.className = 'btn secondary small'; next.type = 'button'; next.textContent = 'Next'; next.setAttribute('aria-label', 'Next build results');
+    actions.append(previous, next); pager.append(count, actions); surface.append(pager);
+    const indexed = rows.map((row, index) => ({ row, index, text: [row.dataset.version, row.dataset.channel, row.dataset.status, row.dataset.date, row.dataset.size, row.cells[2]?.textContent, row.cells[3]?.textContent, row.cells[3]?.title].join(' ').toLocaleLowerCase(), date: Date.parse(row.dataset.date || '') || 0, size: Number(row.dataset.size) || 0, version: row.dataset.version || '' }));
+    const versionOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }); const pageSize = 6; let page = 0;
+    function renderBuildResults() {
+      const query = search.value.trim().toLocaleLowerCase();
+      const matching = indexed.filter(item => (!query || item.text.includes(query)) && (!channel.value || item.row.dataset.channel === channel.value) && (!status.value || item.row.dataset.status === status.value));
+      matching.sort((a, b) => {
+        let order = 0;
+        if (sort.value === 'oldest') order = a.date - b.date;
+        else if (sort.value === 'version-asc') order = versionOrder.compare(a.version, b.version);
+        else if (sort.value === 'version-desc') order = versionOrder.compare(b.version, a.version);
+        else if (sort.value === 'size-asc') order = a.size - b.size;
+        else if (sort.value === 'size-desc') order = b.size - a.size;
+        else order = b.date - a.date;
+        return order || a.index - b.index;
+      });
+      const active = !!query || !!channel.value || !!status.value || sort.value !== 'newest';
+      const pages = Math.max(1, Math.ceil(matching.length / pageSize)); page = Math.min(Math.max(0, page), pages - 1);
+      const visible = active ? matching.slice(page * pageSize, (page + 1) * pageSize) : matching.slice(0, pageSize);
+      body.replaceChildren(...visible.map(item => item.row));
+      if (!matching.length) { const row = body.insertRow(); const cell = row.insertCell(); cell.colSpan = table.tHead.rows[0].cells.length; cell.className = 'empty'; cell.textContent = 'No builds match these filters. Try another search.'; }
+      summary.textContent = active ? matching.length + ' matching builds' : 'Showing ' + Math.min(matching.length, pageSize) + (matching.length > pageSize ? ' most recent of ' : ' of ') + matching.length + ' builds';
+      count.textContent = matching.length + ' results · Page ' + (page + 1) + ' of ' + pages; pager.hidden = !active || pages <= 1;
+      previous.disabled = page === 0; next.disabled = page >= pages - 1;
+    }
+    search.addEventListener('input', () => { page = 0; renderBuildResults(); });
+    [channel, status, sort].forEach(select => select.addEventListener('change', () => { page = 0; renderBuildResults(); }));
+    previous.addEventListener('click', () => { page--; renderBuildResults(); }); next.addEventListener('click', () => { page++; renderBuildResults(); });
+    renderBuildResults();
+  });
+
   $$('table[data-paginate]').forEach(table => {
     const body = table.tBodies[0]; const rows = Array.from(body.rows).filter(row => !row.querySelector('[colspan]'));
     if (!rows.length) return;
