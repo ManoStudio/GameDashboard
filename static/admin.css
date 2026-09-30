@@ -32,6 +32,11 @@ td{white-space:nowrap}td.mono{max-width:180px;overflow:hidden;text-overflow:elli
 }
 :root[data-theme=light] .access-control > form > .button{color:#fff}
 
+.report-description{max-width:440px;min-width:220px;margin:6px 0;color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere}
+.report-status-form{display:flex;align-items:center;gap:6px;min-width:148px}
+.report-status-form select{min-width:88px;min-height:30px;padding:4px 8px}
+.report-status-form .btn{flex-shrink:0}
+
 .build-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) repeat(3,minmax(120px,.45fr));align-items:center}
 .build-toolbar input,.build-toolbar select{width:100%;min-width:0;min-height:34px}
 .build-toolbar input{flex:none}

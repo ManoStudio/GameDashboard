@@ -45,6 +45,13 @@ async function dispatch(request, env, url, user) {
   if (path === "/api/launcher/history" && method === "GET") return launcherHistory(request, env);
   if (path === "/" && method === "GET") return requireLogin(user) || dashboard(request, env, user);
 
+  if (path === "/api/bug-reports" && method === "POST") return requireLogin(user, true) || createBugReport(request, env, user);
+  if (path === "/api/bug-reports" && method === "GET") return requireRole(user, "admin", "dev", "QA", true) || listBugReportsJson(request, env, user);
+  const bugReportLog = path.match(/^\/api\/bug-reports\/([^/]+)\/log$/);
+  if (bugReportLog && method === "GET") return requireRole(user, "admin", "dev", "QA", true) || downloadBugReportLog(env, user, decodeURIComponent(bugReportLog[1]));
+  const bugReportStatus = path.match(/^\/bug-reports\/([^/]+)\/status$/);
+  if (bugReportStatus && method === "POST") return requireRole(user, "admin", "dev", "QA") || updateBugReportStatus(request, env, user, decodeURIComponent(bugReportStatus[1]));
+
   if (path === "/projects" && method === "POST") return requireRole(user, "admin") || createProject(request, env);
   const projectUpdate = path.match(/^\/projects\/([^/]+)$/);
   if (projectUpdate && method === "POST") return requireRole(user, "admin") || updateProject(request, env, projectUpdate[1]);
@@ -169,7 +176,11 @@ async function dashboard(request, env, user) {
   const selected = selectedId ? await getProject(env, selectedId, user) : null;
   const builds = selected ? await listBuilds(env, selected.id, user, url.origin) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
-  return html(renderAdmin({ user, projects, selected, builds, users, view: url.searchParams.get("view") || "dashboard", buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, style }));
+  const view = url.searchParams.get("view") || "dashboard";
+  const bugReports = selected && view === "logs" && ["admin", "dev", "QA"].includes(user.role)
+    ? await listBugReports(env, selected.id)
+    : [];
+  return html(renderAdmin({ user, projects, selected, builds, users, bugReports, view, buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, style }));
 }
 
 async function listProjects(env, user = null) {
@@ -200,6 +211,167 @@ async function listBuilds(env, projectId, user = null, baseUrl = "") {
   const { results } = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all();
   const visibleChannels = new Set(visibleChannelsForRole(user?.role));
   return Promise.all((results || []).filter(row => visibleChannels.has(normalizeChannel(row.channel))).map(row => rowToBuild(env, row, baseUrl)));
+}
+
+async function createBugReport(request, env, user) {
+  let payload;
+  try {
+    payload = await readLimitedJson(request, 768 * 1024);
+  } catch (error) {
+    if (error instanceof RangeError) return json({ error: "report payload exceeds 768 KB" }, 413);
+    return json({ error: "invalid JSON payload" }, 400);
+  }
+
+  const projectId = String(payload.project_id || "").trim();
+  const buildId = String(payload.build_id || "").trim();
+  const description = String(payload.description || "").trim();
+  const sessionId = String(payload.session_id || "").trim().slice(0, 128);
+  const unityVersion = String(payload.unity_version || "").trim().slice(0, 64);
+  const sceneName = String(payload.scene_name || "").trim().slice(0, 200);
+  const logs = typeof payload.logs === "string" ? payload.logs : "";
+
+  if (!projectId || !buildId || description.length < 5 || description.length > 4000) {
+    return json({ error: "project, build, and a 5-4000 character description are required" }, 400);
+  }
+  if (encoder.encode(logs).byteLength > 512 * 1024) {
+    return json({ error: "attached logs exceed the 512 KB limit" }, 413);
+  }
+
+  const project = await getProject(env, projectId, user);
+  if (!project) return json({ error: "project not found or access denied" }, 404);
+  const build = await env.DB.prepare("SELECT id, version, channel FROM builds WHERE id = ? AND project_id = ?")
+    .bind(buildId, projectId)
+    .first();
+  if (!build || !visibleChannelsForRole(user.role).includes(normalizeChannel(build.channel))) {
+    return json({ error: "build not found or access denied" }, 404);
+  }
+
+  const now = nowIso();
+  const reportId = `BUG-${new Date(now).toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8).toUpperCase()}`;
+  const logObjectPath = logs
+    ? `bug-reports/${safeObjectSegment(projectId)}/${reportId}/player.log`
+    : null;
+  if (logObjectPath && !env.BUILDS_BUCKET) return json({ error: "bug report storage is not configured" }, 503);
+
+  let logStored = false;
+  try {
+    if (logObjectPath) {
+      await env.BUILDS_BUCKET.put(logObjectPath, logs, {
+        httpMetadata: { contentType: "text/plain; charset=utf-8" },
+      });
+      logStored = true;
+    }
+
+    await env.DB.prepare(
+      "INSERT INTO bug_reports (id, project_id, build_id, version, reporter_email, description, unity_version, scene_name, session_id, status, log_object_path, log_size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)"
+    ).bind(
+      reportId,
+      projectId,
+      buildId,
+      build.version,
+      user.email,
+      description,
+      unityVersion,
+      sceneName,
+      sessionId,
+      logObjectPath,
+      encoder.encode(logs).byteLength,
+      now,
+      now,
+    ).run();
+  } catch (error) {
+    if (logStored) {
+      try {
+        await env.BUILDS_BUCKET.delete(logObjectPath);
+      } catch {
+        // Keep the original database/storage error as the one returned to the caller.
+      }
+    }
+    throw error;
+  }
+
+  return json({ id: reportId, status: "new" }, 201);
+}
+
+async function readLimitedJson(request, maxBytes) {
+  const declaredLength = Number(request.headers.get("content-length") || 0);
+  if (declaredLength > maxBytes) {
+    await request.body?.cancel();
+    throw new RangeError("request body too large");
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) return {};
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        throw new RangeError("request body too large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+async function listBugReportsJson(request, env, user) {
+  const url = new URL(request.url);
+  const projectId = String(url.searchParams.get("project_id") || "").trim();
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!await getProject(env, projectId, user)) return json({ error: "project not found or access denied" }, 404);
+  return json(await listBugReports(env, projectId));
+}
+
+async function listBugReports(env, projectId) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, project_id, build_id, version, reporter_email, description, unity_version, scene_name, session_id, status, log_object_path, log_size, created_at, updated_at FROM bug_reports WHERE project_id = ? ORDER BY created_at DESC LIMIT 100"
+  ).bind(projectId).all();
+  return results || [];
+}
+
+async function downloadBugReportLog(env, user, reportId) {
+  const report = await env.DB.prepare("SELECT * FROM bug_reports WHERE id = ?").bind(reportId).first();
+  if (!report || !report.log_object_path || !await getProject(env, report.project_id, user)) {
+    return json({ error: "log not found" }, 404);
+  }
+  const object = await env.BUILDS_BUCKET.get(report.log_object_path);
+  if (!object) return json({ error: "log file not found" }, 404);
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("ETag", object.httpEtag);
+  headers.set("Cache-Control", "private, no-store");
+  headers.set("Content-Disposition", `attachment; filename="${report.id}-player.log"`);
+  return new Response(object.body, { headers });
+}
+
+async function updateBugReportStatus(request, env, user, reportId) {
+  const report = await env.DB.prepare("SELECT project_id FROM bug_reports WHERE id = ?").bind(reportId).first();
+  if (!report || !await getProject(env, report.project_id, user)) return json({ error: "bug report not found" }, 404);
+  const form = await request.formData();
+  const status = String(form.get("status") || "").trim();
+  if (!["new", "triaged", "resolved", "closed"].includes(status)) return json({ error: "invalid status" }, 400);
+  await env.DB.prepare("UPDATE bug_reports SET status = ?, updated_at = ? WHERE id = ?")
+    .bind(status, nowIso(), reportId)
+    .run();
+  return redirect(`/?view=logs&project=${encodeURIComponent(report.project_id)}`);
+}
+
+function safeObjectSegment(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^\.+|\.+$/g, "") || "project";
 }
 
 async function launcherLibrary(env, user) {
