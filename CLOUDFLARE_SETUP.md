@@ -137,3 +137,11 @@ npx wrangler deploy
 ```
 
 This project no longer needs Python dependencies for Cloudflare. If Pages still runs `pip install -r requirements.txt`, remove the old Python deployment files from the Cloudflare-connected branch or set the project as a Workers deployment that uses `wrangler.toml`.
+
+## Bug report console and snapshots
+
+Apply D1 migration `0007_bug_report_snapshots.sql` before deploying the updated Worker. Then distribute the updated Mano Launcher and rebuild the Unity game with the updated `com.manostudio.bug-reports` package, in that order. Older clients and reports remain supported without snapshots.
+
+The report list opens a separate Full Detail page. Log downloads, severity filters, search, duplicate collapse, stack traces and game snapshots are available inside that page. Log and image attachments each allow up to 2 MiB. The JSON envelope allows 16 MiB to accommodate escaped log text and base64 images; only validated PNG/JPEG images are stored. Preview and download routes require QA, developer or admin access to the project.
+
+Validation: `npm test`, `node tests/test-worker-render.mjs`, and `npx wrangler deploy --dry-run`. Test the updated game through the updated Launcher after release to verify the actual captured game frame and report upload.

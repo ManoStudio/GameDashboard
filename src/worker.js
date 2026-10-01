@@ -48,7 +48,9 @@ async function dispatch(request, env, url, user) {
   if (path === "/api/bug-reports" && method === "POST") return requireLogin(user, true) || createBugReport(request, env, user);
   if (path === "/api/bug-reports" && method === "GET") return requireRole(user, "admin", "dev", "QA", true) || listBugReportsJson(request, env, user);
   const bugReportLog = path.match(/^\/api\/bug-reports\/([^/]+)\/log$/);
-  if (bugReportLog && method === "GET") return requireRole(user, "admin", "dev", "QA", true) || downloadBugReportLog(env, user, decodeURIComponent(bugReportLog[1]));
+  if (bugReportLog && method === "GET") return requireRole(user, "admin", "dev", "QA", true) || downloadBugReportLog(env, user, decodeURIComponent(bugReportLog[1]), url.searchParams.get("preview") === "1");
+  const bugReportSnapshot = path.match(/^\/api\/bug-reports\/([^/]+)\/snapshot$/);
+  if (bugReportSnapshot && method === "GET") return requireRole(user, "admin", "dev", "QA", true) || downloadBugReportSnapshot(env, user, decodeURIComponent(bugReportSnapshot[1]));
   const bugReportStatus = path.match(/^\/bug-reports\/([^/]+)\/status$/);
   if (bugReportStatus && method === "POST") return requireRole(user, "admin", "dev", "QA") || updateBugReportStatus(request, env, user, decodeURIComponent(bugReportStatus[1]));
 
@@ -177,10 +179,15 @@ async function dashboard(request, env, user) {
   const builds = selected ? await listBuilds(env, selected.id, user, url.origin) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
   const view = url.searchParams.get("view") || "dashboard";
-  const bugReports = selected && view === "logs" && ["admin", "dev", "QA"].includes(user.role)
-    ? await listBugReports(env, selected.id)
-    : [];
-  return html(renderAdmin({ user, projects, selected, builds, users, bugReports, view, buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, style }));
+  let bugReports = [];
+  if (selected && ["logs", "report"].includes(view) && ["admin", "dev", "QA"].includes(user.role)) {
+    if (view === "report") {
+      const report = await env.DB.prepare("SELECT * FROM bug_reports WHERE id = ? AND project_id = ?")
+        .bind(url.searchParams.get("report") || "", selected.id).first();
+      if (report) bugReports = [report];
+    } else bugReports = await listBugReports(env, selected.id);
+  }
+  return html(renderAdmin({ user, projects, selected, builds, users, bugReports, view, reportId: url.searchParams.get("report"), buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, style }));
 }
 
 async function listProjects(env, user = null) {
@@ -216,12 +223,13 @@ async function listBuilds(env, projectId, user = null, baseUrl = "") {
 async function createBugReport(request, env, user) {
   let payload;
   try {
-    payload = await readLimitedJson(request, 768 * 1024);
+    payload = await readLimitedJson(request, 16 * 1024 * 1024);
   } catch (error) {
-    if (error instanceof RangeError) return json({ error: "report payload exceeds 768 KB" }, 413);
+    if (error instanceof RangeError) return json({ error: "report payload exceeds 16 MB" }, 413);
     return json({ error: "invalid JSON payload" }, 400);
   }
 
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return json({ error: "invalid report payload" }, 400);
   const projectId = String(payload.project_id || "").trim();
   const buildId = String(payload.build_id || "").trim();
   const description = String(payload.description || "").trim();
@@ -233,10 +241,13 @@ async function createBugReport(request, env, user) {
   if (!projectId || !buildId || description.length < 5 || description.length > 4000) {
     return json({ error: "project, build, and a 5-4000 character description are required" }, 400);
   }
-  if (encoder.encode(logs).byteLength > 512 * 1024) {
-    return json({ error: "attached logs exceed the 512 KB limit" }, 413);
+  if (encoder.encode(logs).byteLength > 2 * 1024 * 1024) {
+    return json({ error: "attached logs exceed the 2 MB limit" }, 413);
   }
 
+  let snapshot;
+  try { snapshot = decodeSnapshot(payload.snapshot); }
+  catch (error) { return json({ error: error.message }, error instanceof RangeError ? 413 : 400); }
   const project = await getProject(env, projectId, user);
   if (!project) return json({ error: "project not found or access denied" }, 404);
   const build = await env.DB.prepare("SELECT id, version, channel FROM builds WHERE id = ? AND project_id = ?")
@@ -251,19 +262,24 @@ async function createBugReport(request, env, user) {
   const logObjectPath = logs
     ? `bug-reports/${safeObjectSegment(projectId)}/${reportId}/player.log`
     : null;
-  if (logObjectPath && !env.BUILDS_BUCKET) return json({ error: "bug report storage is not configured" }, 503);
+  const snapshotObjectPath = snapshot ? `bug-reports/${safeObjectSegment(projectId)}/${reportId}/snapshot.${snapshot.type === "image/png" ? "png" : "jpg"}` : null;
+  if ((logObjectPath || snapshotObjectPath) && !env.BUILDS_BUCKET) return json({ error: "bug report storage is not configured" }, 503);
 
-  let logStored = false;
+  const storedPaths = [];
   try {
     if (logObjectPath) {
       await env.BUILDS_BUCKET.put(logObjectPath, logs, {
         httpMetadata: { contentType: "text/plain; charset=utf-8" },
       });
-      logStored = true;
+      storedPaths.push(logObjectPath);
     }
 
+    if (snapshotObjectPath) {
+      await env.BUILDS_BUCKET.put(snapshotObjectPath, snapshot.bytes, { httpMetadata: { contentType: snapshot.type } });
+      storedPaths.push(snapshotObjectPath);
+    }
     await env.DB.prepare(
-      "INSERT INTO bug_reports (id, project_id, build_id, version, reporter_email, description, unity_version, scene_name, session_id, status, log_object_path, log_size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)"
+      "INSERT INTO bug_reports (id, project_id, build_id, version, reporter_email, description, unity_version, scene_name, session_id, status, log_object_path, log_size, snapshot_object_path, snapshot_size, snapshot_content_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)"
     ).bind(
       reportId,
       projectId,
@@ -276,13 +292,16 @@ async function createBugReport(request, env, user) {
       sessionId,
       logObjectPath,
       encoder.encode(logs).byteLength,
+      snapshotObjectPath,
+      snapshot?.bytes.byteLength || 0,
+      snapshot?.type || null,
       now,
       now,
     ).run();
   } catch (error) {
-    if (logStored) {
+    if (storedPaths.length) {
       try {
-        await env.BUILDS_BUCKET.delete(logObjectPath);
+        await env.BUILDS_BUCKET.delete(storedPaths);
       } catch {
         // Keep the original database/storage error as the one returned to the caller.
       }
@@ -338,12 +357,12 @@ async function listBugReportsJson(request, env, user) {
 
 async function listBugReports(env, projectId) {
   const { results } = await env.DB.prepare(
-    "SELECT id, project_id, build_id, version, reporter_email, description, unity_version, scene_name, session_id, status, log_object_path, log_size, created_at, updated_at FROM bug_reports WHERE project_id = ? ORDER BY created_at DESC LIMIT 100"
+    "SELECT id, project_id, build_id, version, reporter_email, description, unity_version, scene_name, session_id, status, log_object_path, log_size, snapshot_object_path, snapshot_size, snapshot_content_type, created_at, updated_at FROM bug_reports WHERE project_id = ? ORDER BY created_at DESC LIMIT 100"
   ).bind(projectId).all();
   return results || [];
 }
 
-async function downloadBugReportLog(env, user, reportId) {
+async function downloadBugReportLog(env, user, reportId, preview = false) {
   const report = await env.DB.prepare("SELECT * FROM bug_reports WHERE id = ?").bind(reportId).first();
   if (!report || !report.log_object_path || !await getProject(env, report.project_id, user)) {
     return json({ error: "log not found" }, 404);
@@ -354,8 +373,36 @@ async function downloadBugReportLog(env, user, reportId) {
   object.writeHttpMetadata(headers);
   headers.set("ETag", object.httpEtag);
   headers.set("Cache-Control", "private, no-store");
-  headers.set("Content-Disposition", `attachment; filename="${report.id}-player.log"`);
+  headers.set("Content-Type", "text/plain; charset=utf-8");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Content-Disposition", `${preview ? "inline" : "attachment"}; filename="${report.id}-player.log"`);
   return new Response(object.body, { headers });
+}
+
+async function downloadBugReportSnapshot(env, user, reportId) {
+  const report = await env.DB.prepare("SELECT * FROM bug_reports WHERE id = ?").bind(reportId).first();
+  if (!report?.snapshot_object_path || !await getProject(env, report.project_id, user)) return json({ error: "snapshot not found" }, 404);
+  const object = await env.BUILDS_BUCKET.get(report.snapshot_object_path);
+  if (!object) return json({ error: "snapshot file not found" }, 404);
+  return new Response(object.body, { headers: {
+    "Content-Type": report.snapshot_content_type === "image/png" ? "image/png" : "image/jpeg",
+    "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+    "Content-Disposition": "inline", "ETag": object.httpEtag,
+  } });
+}
+
+function decodeSnapshot(value) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string") throw new Error("snapshot must be a PNG or JPEG base64 data URL");
+  const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/]*={0,2})$/.exec(value);
+  if (!match || match[2].length % 4 !== 0) throw new Error("invalid snapshot data URL");
+  if (match[2].length > Math.ceil(2 * 1024 * 1024 / 3) * 4) throw new RangeError("snapshot exceeds the 2 MB limit");
+  const bytes = Uint8Array.from(atob(match[2]), character => character.charCodeAt(0));
+  if (bytes.byteLength > 2 * 1024 * 1024) throw new RangeError("snapshot exceeds the 2 MB limit");
+  const png = [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte);
+  const jpeg = bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+  if (!(match[1] === "image/png" ? png : jpeg)) throw new Error("snapshot content does not match its image type");
+  return { bytes, type: match[1] };
 }
 
 async function updateBugReportStatus(request, env, user, reportId) {
@@ -367,7 +414,7 @@ async function updateBugReportStatus(request, env, user, reportId) {
   await env.DB.prepare("UPDATE bug_reports SET status = ?, updated_at = ? WHERE id = ?")
     .bind(status, nowIso(), reportId)
     .run();
-  return redirect(`/?view=logs&project=${encodeURIComponent(report.project_id)}`);
+  return redirect(`/?view=${form.get("return_to") === "report" ? "report" : "logs"}&project=${encodeURIComponent(report.project_id)}${form.get("return_to") === "report" ? "&report=" + encodeURIComponent(reportId) : ""}`);
 }
 
 function safeObjectSegment(value) {

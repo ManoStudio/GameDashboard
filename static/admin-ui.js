@@ -22,7 +22,8 @@ function initAdmin() {
   }));
   $$('[data-project-selector]').forEach(node => node.addEventListener('change', () => {
     const url = new URL(location.href); url.searchParams.set('project', node.value);
-    ['log_project', 'log_version', 'build', 'log'].forEach(key => url.searchParams.delete(key));
+    ['log_project', 'log_version', 'build', 'log', 'report'].forEach(key => url.searchParams.delete(key));
+    if (url.searchParams.get('view') === 'report') url.searchParams.set('view', 'logs');
     if (['build', 'log'].includes(url.searchParams.get('view'))) url.searchParams.set('view', 'dashboard');
     location.href = url;
   }));
@@ -204,4 +205,95 @@ function initAdmin() {
   try { const message = sessionStorage.getItem('admin-notice'); if (message) { sessionStorage.removeItem('admin-notice'); toast(message); } } catch {}
 }
 
+function parseUnityLog(text) {
+  const entries = [];
+  const header = /^(?:(\d{4}-\d{2}-\d{2}T\S+)\s+)?\[(Log|Warning|Error|Exception|Assert)\]\s?(.*)$/i;
+  for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const match = header.exec(line);
+    if (match) {
+      const type = match[2].toLowerCase();
+      entries.push({ id: entries.length, time: match[1] || '', level: type === 'warning' ? 'warning' : ['error', 'exception', 'assert'].includes(type) ? 'error' : 'log', message: match[3], raw: line });
+    } else if (entries.length) {
+      entries[entries.length - 1].raw += '\n' + line;
+    } else if (line.trim()) {
+      entries.push({ id: entries.length, time: '', level: 'log', message: line, raw: line });
+    }
+  }
+  return entries;
+}
+
+function initReportConsole() {
+  const root = document.querySelector('[data-report-console]');
+  if (!root) return;
+  const $ = selector => root.querySelector(selector);
+  const list = $('[data-log-list]'), state = $('[data-console-state]'), detail = $('[data-log-detail]');
+  let entries = [], filtered = [], page = 0, level = 'all', selected = null, loading = false;
+  const pageSize = 100;
+  function render() {
+    const search = $('[data-log-search]').value.toLowerCase();
+    const counts = { all: entries.length, log: 0, warning: 0, error: 0 };
+    entries.forEach(entry => counts[entry.level]++);
+    root.querySelectorAll('[data-log-count]').forEach(node => node.textContent = counts[node.dataset.logCount]);
+    filtered = entries.filter(entry => (level === 'all' || entry.level === level) && entry.raw.toLowerCase().includes(search));
+    if ($('[data-log-collapse]').checked) {
+      const groups = new Map();
+      filtered.forEach(entry => {
+        const key = entry.level + '\n' + entry.raw.replace(/^\d{4}-\d{2}-\d{2}T\S+\s+/, '');
+        const existing = groups.get(key);
+        if (existing) existing.count++;
+        else groups.set(key, { ...entry, count: 1 });
+      });
+      filtered = [...groups.values()];
+    }
+    page = Math.max(0, Math.min(page, Math.ceil(filtered.length / pageSize) - 1));
+    const visible = filtered.slice(page * pageSize, (page + 1) * pageSize);
+    if (selected !== null && !filtered.some(entry => entry.id === selected)) {
+      selected = null; detail.textContent = 'Select a log entry to inspect its full message and stack trace.'; $('[data-copy-entry]').disabled = true;
+    }
+    list.replaceChildren();
+    visible.forEach(entry => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'console-entry'; button.setAttribute('aria-pressed', String(entry.id === selected));
+      for (const [className, text] of [['entry-level ' + entry.level, entry.level.toUpperCase()], ['entry-time', entry.time ? entry.time.slice(11, 23) : '—'], ['entry-message', entry.message], ['entry-count', entry.count > 1 ? '×' + entry.count : '']]) {
+        const span = document.createElement('span'); span.className = className; span.textContent = text; button.append(span);
+      }
+      button.addEventListener('click', () => { selected = entry.id; detail.textContent = entry.raw;  $('[data-copy-entry]').disabled = false; list.querySelectorAll('.console-entry').forEach(node => node.setAttribute('aria-pressed', String(node === button))); });
+      list.append(button);
+    });
+    $('[data-log-page]').textContent = filtered.length ? `${page * pageSize + 1}–${Math.min((page + 1) * pageSize, filtered.length)} of ${filtered.length} entries` : '0 entries';
+    $('[data-log-prev]').disabled = page === 0;
+    $('[data-log-next]').disabled = (page + 1) * pageSize >= filtered.length;
+    if (!loading) { state.hidden = filtered.length > 0; state.textContent = entries.length ? 'No entries match these filters.' : root.dataset.logUrl ? 'The attached log is empty.' : 'No log attached to this report.'; }
+  }
+  async function load() {
+    if (loading || !root.dataset.logUrl) return;
+    loading = true; state.hidden = false; state.textContent = 'Loading logs…'; $('[data-log-retry]').disabled = true;
+    try {
+      const response = await fetch(root.dataset.logUrl, { credentials: 'same-origin', cache: 'no-store' });
+      if (!response.ok) throw new Error(response.status === 401 ? 'Session expired. Sign in again to view logs.' : 'Unable to load log. Use Reload to try again.');
+      entries = parseUnityLog(await response.text()); page = 0; selected = null;
+      detail.textContent = 'Select a log entry to inspect its full message and stack trace.'; $('[data-copy-entry]').disabled = true;
+      loading = false; render();
+    } catch (error) { state.hidden = false; state.textContent = error.message; }
+    finally { loading = false; $('[data-log-retry]').disabled = false; }
+  }
+  $('[data-log-search]').addEventListener('input', () => { page = 0; render(); });
+  $('[data-log-collapse]').addEventListener('change', () => { page = 0; render(); });
+  root.querySelectorAll('[data-log-level]').forEach(button => button.addEventListener('click', () => {
+    level = button.dataset.logLevel; page = 0;
+    root.querySelectorAll('[data-log-level]').forEach(node => node.setAttribute('aria-pressed', String(node === button))); render();
+  }));
+  $('[data-log-prev]').addEventListener('click', () => { page--; render(); list.scrollTop = 0; });
+  $('[data-log-next]').addEventListener('click', () => { page++; render(); list.scrollTop = 0; });
+  $('[data-log-retry]').addEventListener('click', load);
+  $('[data-copy-entry]').addEventListener('click', async () => {
+    const button = $('[data-copy-entry]');
+    try { await navigator.clipboard.writeText(detail.textContent); button.textContent = 'Copied'; }
+    catch { button.textContent = 'Copy failed — select text'; }
+    setTimeout(() => button.textContent = 'Copy entry', 2000);
+  });
+  render(); void load();
+}
+
 initAdmin();
+initReportConsole();

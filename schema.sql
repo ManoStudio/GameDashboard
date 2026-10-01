@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS bug_reports (
   status TEXT NOT NULL DEFAULT 'new',
   log_object_path TEXT,
   log_size INTEGER NOT NULL DEFAULT 0,
+  snapshot_object_path TEXT,
+  snapshot_size INTEGER NOT NULL DEFAULT 0,
+  snapshot_content_type TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
