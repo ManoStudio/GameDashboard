@@ -145,3 +145,7 @@ Apply D1 migration `0007_bug_report_snapshots.sql` before deploying the updated 
 The report list opens a separate Full Detail page. Log downloads, severity filters, search, duplicate collapse, stack traces and game snapshots are available inside that page. Log and image attachments each allow up to 2 MiB. The JSON envelope allows 16 MiB to accommodate escaped log text and base64 images; only validated PNG/JPEG images are stored. Preview and download routes require QA, developer or admin access to the project.
 
 Validation: `npm test`, `node tests/test-worker-render.mjs`, and `npx wrangler deploy --dry-run`. Test the updated game through the updated Launcher after release to verify the actual captured game frame and report upload.
+
+## Automatic game build versions
+
+Apply D1 migration `0008_auto_build_versions.sql` before deploying this Worker. New uploads always receive `<project icon>-Build-<number>` from the server, starting at 1 independently per project. Upload completion uses the reserved version and ignores client version overrides. Deleting builds or changing the project icon does not reset the counter. Abandoned uploads can leave unused numbers. Existing builds keep their versions.

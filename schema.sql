@@ -129,3 +129,17 @@ CREATE INDEX IF NOT EXISTS idx_bug_reports_project_created ON bug_reports(projec
 CREATE INDEX IF NOT EXISTS idx_bug_reports_build_created ON bug_reports(build_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bug_reports_status_created ON bug_reports(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email);
+
+-- Counters survive build deletion. Abandoned uploads may leave gaps, never reused numbers.
+CREATE TABLE IF NOT EXISTS project_build_counters (
+  project_id TEXT PRIMARY KEY,
+  last_number INTEGER NOT NULL CHECK (last_number > 0)
+);
+
+CREATE TABLE IF NOT EXISTS build_upload_versions (
+  build_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  uploaded_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);

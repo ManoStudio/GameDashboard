@@ -583,7 +583,11 @@ async function initUploadSession(request, env, user, projectId) {
   const files = payload.files || [];
   if (!files.length) return json({ error: "files are required" }, 400);
   const buildId = `build-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
-  const version = payload.version || await nextVersion(env, projectId);
+  const project = await getProject(env, projectId, user);
+  if (!project) return json({ error: "project not found" }, 404);
+  const version = await nextVersion(env, projectId, project.icon);
+  await env.DB.prepare("INSERT INTO build_upload_versions (build_id, project_id, version, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(buildId, projectId, version, user.email, nowIso()).run();
   const uploads = [];
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
@@ -602,7 +606,17 @@ async function initUploadSession(request, env, user, projectId) {
 
 async function completeUploadSession(request, env, user, projectId, buildId) {
   const baseUrl = new URL(request.url).origin;
+  const project = await getProject(env, projectId, user);
+  if (!project) return json({ error: "project not found" }, 404);
+  const reservation = await env.DB.prepare("SELECT * FROM build_upload_versions WHERE build_id = ? AND project_id = ? AND uploaded_by = ?")
+    .bind(buildId, projectId, user.email).first();
+  if (!reservation) return json({ error: "Upload session not found. Initialize a new upload." }, 400);
+  if (await env.DB.prepare("SELECT id FROM builds WHERE id = ?").bind(buildId).first()) {
+    return json({ error: "Build already completed" }, 409);
+  }
   const payload = await request.json();
+  // The version reserved by the server is authoritative, even for older clients.
+  payload.version = reservation.version;
   const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
   if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
@@ -628,12 +642,13 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
     files: manifestFiles,
   };
   const build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl, user);
+  await env.DB.prepare("DELETE FROM build_upload_versions WHERE build_id = ?").bind(buildId).run();
   return json(build, 201);
 }
 
 async function saveBuild(env, projectId, buildId, payload, manifest, baseUrl = "", user = null) {
   const now = nowIso();
-  const version = payload.version || await nextVersion(env, projectId);
+  const version = payload.version;
   const channel = String(payload.channel || "dev").trim().toLowerCase();
   const manifestJson = JSON.stringify(manifest);
   const manifestId = stringField(payload, "manifest_id") || await sha256Hex(manifestJson);
@@ -977,12 +992,15 @@ async function validArtifactSignature(env, key, params) {
   return signature === expected;
 }
 
-async function nextVersion(env, projectId) {
-  const latest = await env.DB.prepare("SELECT version FROM builds WHERE project_id = ? ORDER BY created_at DESC LIMIT 1").bind(projectId).first();
-  if (!latest) return "1.0.0";
-  const parts = latest.version.split(".").map(part => Number(part));
-  return parts.length === 3 && parts.every(Number.isInteger) ? `${parts[0]}.${parts[1]}.${parts[2] + 1}` : `${latest.version}.1`;
+async function nextVersion(env, projectId, icon) {
+  // A single atomic write allocates the number, including simultaneous upload starts.
+  const counter = await env.DB.prepare(
+    "INSERT INTO project_build_counters (project_id, last_number) VALUES (?, 1) ON CONFLICT(project_id) DO UPDATE SET last_number = last_number + 1 RETURNING last_number"
+  ).bind(projectId).first();
+  return `${String(icon || "GM").trim()}-Build-${counter.last_number}`;
 }
+
+
 
 async function rowToBuild(env, row, baseUrl = "") {
   if (!row) return null;
@@ -1378,7 +1396,7 @@ function projectManagement(user, project, builds, latest) {
 }
 
 function uploadPanel(user, project) {
-  return `<div class="panel"><h3>Build Upload</h3><form class="form-grid" data-direct-upload="true" data-init-url="/api/projects/${project.id}/uploads/init" data-complete-base="/api/projects/${project.id}/uploads" data-return-url="/?view=builds&project=${project.id}" data-loading-steps="Preparing R2 upload|Hashing files|Uploading files|Saving build"><label class="dropzone"><input type="file" name="build" multiple required><span><strong>Drop build zip here</strong><span>Select a build package or drop files here.</span></span></label><div class="form-grid trio"><label class="field"><span class="label">Version</span><input name="version" placeholder="auto"></label><label class="field"><span class="label">Channel</span><select name="channel">${CHANNELS.filter(c => user.role === "admin" || c !== "live").map(c => `<option>${c}</option>`).join("")}</select></label><label class="field"><span class="label">Tag</span><input name="tag" placeholder="hotfix / stable"></label></div><label class="field"><span class="label">Changelog</span><textarea name="changelog"></textarea></label><button class="button">Upload Build</button></form></div>`;
+  return `<div class="panel"><h3>Build Upload</h3><form class="form-grid" data-direct-upload="true" data-init-url="/api/projects/${project.id}/uploads/init" data-complete-base="/api/projects/${project.id}/uploads" data-return-url="/?view=builds&project=${project.id}" data-loading-steps="Preparing R2 upload|Hashing files|Uploading files|Saving build"><label class="dropzone"><input type="file" name="build" multiple required><span><strong>Drop build zip here</strong><span>Select a build package or drop files here.</span></span></label><div class="form-grid trio"><label class="field"><span class="label">Version</span><input value="${escapeHtml(project.icon)}-Build-(auto)" readonly aria-label="Automatically generated version"><small>Version is generated automatically for every upload.</small></label><label class="field"><span class="label">Channel</span><select name="channel">${CHANNELS.filter(c => user.role === "admin" || c !== "live").map(c => `<option>${c}</option>`).join("")}</select></label><label class="field"><span class="label">Tag</span><input name="tag" placeholder="hotfix / stable"></label></div><label class="field"><span class="label">Changelog</span><textarea name="changelog"></textarea></label><button class="button">Upload Build</button></form></div>`;
 }
 
 function userAccess(users, currentUser) {
