@@ -15,10 +15,45 @@ function initAdmin() {
   try {
     document.documentElement.dataset.theme = localStorage.getItem('game-build-dashboard-theme') === 'light' ? 'light' : 'dark';
   } catch {}
+  const updateThemeLabels = () => $$('[data-theme-toggle]').forEach(node => {
+    const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+    node.setAttribute('aria-label', 'Switch to ' + next + ' theme');
+    node.title = 'Switch to ' + next + ' theme';
+  });
+  updateThemeLabels();
+  const navToggle = $('[data-nav-toggle]');
+  if (navToggle) {
+    document.body.classList.add('navigation-ready');
+    const setNavigation = open => {
+      document.body.classList.toggle('nav-open', open);
+      navToggle.setAttribute('aria-expanded', String(open));
+      navToggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    };
+    navToggle.addEventListener('click', () => setNavigation(!document.body.classList.contains('nav-open')));
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('nav-open')) {
+        setNavigation(false); navToggle.focus();
+      }
+    });
+  }
+  const revealFragment = () => {
+    try {
+      const id = decodeURIComponent(location.hash.slice(1));
+      const node = id && document.getElementById(id);
+      if (node?.tagName === 'DETAILS') node.open = true;
+    } catch {}
+  };
+  window.addEventListener('hashchange', revealFragment);
+  $$('a[href^="#"]').forEach(anchor => anchor.addEventListener('click', () => {
+    const node = document.getElementById(anchor.getAttribute('href').slice(1));
+    if (node?.tagName === 'DETAILS') node.open = true;
+  }));
+  revealFragment();
   $$('[data-theme-toggle]').forEach(node => node.addEventListener('click', () => {
     const theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem('game-build-dashboard-theme', theme); } catch {}
+    updateThemeLabels();
   }));
   $$('[data-project-selector]').forEach(node => node.addEventListener('change', () => {
     const url = new URL(location.href); url.searchParams.set('project', node.value);
@@ -72,7 +107,13 @@ function initAdmin() {
     const next = document.createElement('button'); next.className = 'btn secondary small'; next.type = 'button'; next.textContent = 'Next'; next.setAttribute('aria-label', 'Next build results');
     actions.append(previous, next); pager.append(count, actions); surface.append(pager);
     const indexed = rows.map((row, index) => ({ row, index, text: [row.dataset.version, row.dataset.channel, row.dataset.status, row.dataset.date, row.dataset.size, row.cells[2]?.textContent, row.cells[3]?.textContent, row.cells[3]?.title].join(' ').toLocaleLowerCase(), date: Date.parse(row.dataset.date || '') || 0, size: Number(row.dataset.size) || 0, version: row.dataset.version || '' }));
-    const versionOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }); const pageSize = 6; let page = 0;
+    const versionOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+    const recent = table.hasAttribute('data-recent'); const pageSize = recent ? 6 : 20; let page = 0;
+    const reset = button('Clear filters', () => {
+      search.value = ''; channel.value = ''; status.value = ''; sort.value = 'date-desc'; page = 0; renderBuildResults(); search.focus();
+    });
+    reset.classList.add('filter-reset'); summary.append(reset);
+    const summaryText = document.createElement('span'); summary.prepend(summaryText);
     function renderBuildResults() {
       const query = search.value.trim().toLocaleLowerCase();
       const matching = indexed.filter(item => (!query || item.text.includes(query)) && (!channel.value || item.row.dataset.channel === channel.value) && (!status.value || item.row.dataset.status === status.value));
@@ -86,11 +127,12 @@ function initAdmin() {
       });
       const active = !!query || !!channel.value || !!status.value || sort.value !== 'date-desc';
       const pages = Math.max(1, Math.ceil(matching.length / pageSize)); page = Math.min(Math.max(0, page), pages - 1);
-      const visible = active ? matching.slice(page * pageSize, (page + 1) * pageSize) : matching.slice(0, pageSize);
+      const visible = matching.slice(page * pageSize, (page + 1) * pageSize);
       body.replaceChildren(...visible.map(item => item.row));
       if (!matching.length) { const row = body.insertRow(); const cell = row.insertCell(); cell.colSpan = table.tHead.rows[0].cells.length; cell.className = 'empty'; cell.textContent = 'No builds match these filters. Try another search.'; }
-      summary.textContent = active ? matching.length + ' matching builds' : 'Showing ' + Math.min(matching.length, pageSize) + (matching.length > pageSize ? ' most recent of ' : ' of ') + matching.length + ' builds';
-      count.textContent = matching.length + ' results · Page ' + (page + 1) + ' of ' + pages; pager.hidden = !active || pages <= 1;
+      summaryText.textContent = active ? matching.length + ' matching builds' : recent ? 'Showing ' + Math.min(matching.length, pageSize) + (matching.length > pageSize ? ' most recent of ' : ' of ') + matching.length + ' builds' : matching.length + ' builds';
+      reset.hidden = !active;
+      count.textContent = matching.length + ' results · Page ' + (page + 1) + ' of ' + pages; pager.hidden = (recent && !active) || pages <= 1;
       previous.disabled = page === 0; next.disabled = page >= pages - 1;
     }
     search.addEventListener('input', () => { page = 0; renderBuildResults(); });
@@ -107,7 +149,7 @@ function initAdmin() {
     const filters = [];
     ['channel', 'platform', 'status'].forEach(key => {
       const values = [...new Set(rows.map(row => row.dataset[key]).filter(Boolean))]; if (values.length < 2) return;
-      const select = document.createElement('select'); select.setAttribute('aria-label', 'Filter ' + key); select.add(new Option('All ' + key + 's', ''));
+      const select = document.createElement('select'); select.setAttribute('aria-label', 'Filter ' + key); select.add(new Option('All ' + ({ channel: 'channels', platform: 'platforms', status: 'statuses' }[key] || key), ''));
       values.forEach(value => select.add(new Option(value, value))); filters.push([key, select]); toolbar.append(select);
       select.addEventListener('change', () => { page = 0; render(); });
     });
@@ -153,9 +195,35 @@ function initAdmin() {
   window.addEventListener('beforeunload', event => { if (activeUpload) { event.preventDefault(); event.returnValue = ''; } });
   $$('form[data-direct-upload]').forEach(form => {
     const input = $('input[type=file]', form); const zone = input.closest('.dropzone');
+    const layout = form.closest('.upload-layout');
+    const channelHints = {
+      dev: 'Development builds are available to developers and admins.',
+      qa: 'QA builds are available to QA, developers, and admins.',
+      live: 'Live builds are available to viewer accounts and the rest of your team.',
+      deprecated: 'Deprecated builds are retained outside the active release channels.',
+      stable: 'Stable builds are available in the stable release channel.',
+    };
+    const updateReleaseSummary = () => {
+      if (!layout) return;
+      const files = Array.from(input.files);
+      const channel = $('select[name=channel]', form);
+      const values = {
+        '[data-summary-package]': files.length ? files.length + (files.length === 1 ? ' file selected' : ' files selected') : 'No files selected',
+        '[data-summary-size]': files.length ? format(files.reduce((sum, file) => sum + file.size, 0)) : '—',
+        '[data-summary-channel]': channel?.selectedOptions[0]?.textContent || 'Not selected',
+        '[data-summary-tag]': $('input[name=tag]', form)?.value.trim() || 'None',
+      };
+      Object.entries(values).forEach(([selector, value]) => {
+        const node = $(selector, layout); if (node) node.textContent = value;
+      });
+      const hint = $('[data-channel-hint]', form); if (hint) hint.textContent = channelHints[channel?.value] || '';
+    };
     const summary = document.createElement('p'); summary.className = 'file-summary'; summary.setAttribute('aria-live', 'polite'); zone.after(summary);
     const format = bytes => bytes >= 1073741824 ? (bytes / 1073741824).toFixed(2) + ' GB' : (bytes / 1048576).toFixed(1) + ' MB';
-    const selected = () => { const files = Array.from(input.files); summary.textContent = files.length ? files.map(file => file.name).join(', ') + ' · ' + format(files.reduce((sum, file) => sum + file.size, 0)) : ''; };
+    const selected = () => { const files = Array.from(input.files); summary.textContent = files.length ? files.map(file => file.name).join(', ') + ' · ' + format(files.reduce((sum, file) => sum + file.size, 0)) : ''; updateReleaseSummary(); };
+    form.addEventListener('input', updateReleaseSummary);
+    form.addEventListener('change', updateReleaseSummary);
+    updateReleaseSummary();
     input.addEventListener('change', selected);
     zone.addEventListener('dragover', event => { event.preventDefault(); if (!activeUpload) zone.classList.add('dragging'); });
     zone.addEventListener('dragleave', () => zone.classList.remove('dragging'));

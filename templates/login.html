@@ -303,10 +303,11 @@
             border-top-color: var(--cyan);
         }
     </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
 </head>
 
 <body>
-    <main class="panel">
+    <main class="login panel">
         <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to light theme"
             title="Switch theme">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
@@ -316,9 +317,9 @@
             </svg>
         </button>
         <div class="brand">
-            <div class="mark">BP</div>
+            <div class="mark">M</div>
             <div>
-                <h1>Build Producer</h1>
+                <h1>Mano Dashboard</h1>
                 <div class="meta">Dashboard login</div>
             </div>
         </div>

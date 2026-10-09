@@ -1,24 +1,24 @@
 export const MODERN_THEME_STYLE = String.raw`:root {
             color-scheme: dark;
-            --page: #0b1016;
-            --sidebar: #111a24;
-            --panel: #151f2a;
-            --panel-raised: #192531;
-            --field: #101821;
-            --code: #0b1219;
-            --ink: #f2f6fb;
-            --muted: #8ea1b5;
-            --muted-strong: #b7c5d4;
-            --line: #2a3b4c;
-            --line-soft: rgba(151, 178, 204, 0.15);
-            --cyan: #54d9ff;
-            --cyan-strong: #0da9dc;
-            --cyan-soft: rgba(84, 217, 255, 0.12);
-            --lime: #58df91;
-            --lime-soft: rgba(88, 223, 145, 0.12);
-            --amber: #f2a45d;
+            --page: #101216;
+            --sidebar: #15171c;
+            --panel: #191c22;
+            --panel-raised: #22262e;
+            --field: #121419;
+            --code: #121419;
+            --ink: #f2f3f5;
+            --muted: #a0a8b5;
+            --muted-strong: #bbc1cc;
+            --line: #30343e;
+            --line-soft: rgba(146, 154, 168, 0.15);
+            --cyan: #a9cb78;
+            --cyan-strong: #bedc92;
+            --cyan-soft: rgba(169, 203, 120, 0.12);
+            --lime: #a9cb78;
+            --lime-soft: rgba(169, 203, 120, 0.12);
+            --amber: #e0b36d;
             --amber-soft: rgba(242, 164, 93, 0.13);
-            --rose: #f27686;
+            --rose: #ef9898;
             --rose-soft: rgba(242, 118, 134, 0.12);
             --shadow: 0 22px 60px rgba(0, 0, 0, 0.22);
         }
@@ -36,10 +36,10 @@ export const MODERN_THEME_STYLE = String.raw`:root {
             --muted-strong: #46586a;
             --line: #d7e1ea;
             --line-soft: rgba(75, 100, 124, 0.14);
-            --cyan: #079dce;
-            --cyan-strong: #047da8;
-            --cyan-soft: rgba(7, 157, 206, 0.11);
-            --lime: #2eaf68;
+            --cyan: #52752c;
+            --cyan-strong: #426120;
+            --cyan-soft: rgba(87, 124, 18, 0.11);
+            --lime: #52752c;
             --lime-soft: rgba(46, 175, 104, 0.11);
             --amber: #bf701c;
             --amber-soft: rgba(191, 112, 28, 0.11);
@@ -83,7 +83,7 @@ export const MODERN_THEME_STYLE = String.raw`:root {
         .project-icon {
             border-radius: 13px;
             background: var(--cyan);
-            color: #06131b;
+            color: #172110;
             box-shadow: none;
         }
 
@@ -131,7 +131,7 @@ export const MODERN_THEME_STYLE = String.raw`:root {
         .project-link:hover,
         .project-link.active {
             background: var(--cyan-soft);
-            border-color: rgba(84, 217, 255, 0.34);
+            border-color: rgba(169, 203, 120, 0.34);
         }
 
         .project-link .project-icon {
@@ -182,7 +182,7 @@ export const MODERN_THEME_STYLE = String.raw`:root {
             border-radius: 11px;
             border: 1px solid transparent;
             background: var(--cyan);
-            color: #07151c;
+            color: #172110;
             padding: 0 15px;
             font-size: 13px;
             font-weight: 800;
@@ -300,7 +300,7 @@ export const MODERN_THEME_STYLE = String.raw`:root {
         }
 
         .dropzone:hover {
-            background: rgba(84, 217, 255, 0.18);
+            background: rgba(169, 203, 120, 0.18);
             border-color: var(--cyan-strong);
         }
 

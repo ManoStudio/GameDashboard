@@ -10,3 +10,13 @@
 {% else %}<tr><td colspan="7" class="empty"><strong>No logs uploaded</strong>Logs uploaded from the launcher will appear here.</td></tr>{% endfor %}
 </tbody></table></div>
 {% endmacro %}
+
+{% macro release_channels(builds, project) %}
+<div class="section-heading"><div><h2>Release channels</h2><p>Latest available build for each channel.</p></div><span class="section-hint">Available in Mano Launcher</span></div>
+<div class="channel-grid">
+{% for key, name, caption in [('dev','Development','Internal iteration'),('qa','QA','Playtest validation'),('stable','Stable','Stable releases')] %}
+{% set ns = namespace(build=none) %}{% for build in builds %}{% if not ns.build and build.channel == key and build.enabled %}{% set ns.build = build %}{% endif %}{% endfor %}
+<section class="surface channel-card {{ 'live' if key == 'stable' else key }}"><div class="channel-card-heading"><span class="channel-name"><i></i>{{ name }}</span><span class="channel-caption">{{ caption }}</span></div>
+{% if ns.build %}<a class="channel-version" href="{{ url_for('index',view='build',project=project.id,build=ns.build.id) }}">{{ ns.build.version }}</a><div class="channel-meta"><code>{{ ns.build.commit_sha[:7] or 'No commit' }}</code><span>{{ '%.2f'|format(ns.build.size / 1073741824) }} GB</span></div><div class="channel-card-footer"><span>{{ ns.build.uploaded_at[:10] }}</span><a class="link-btn" href="{{ url_for('index',view='build',project=project.id,build=ns.build.id) }}">View build →</a></div>{% else %}<div class="channel-empty"><strong>No build assigned</strong><p>A new release will appear here when it is available.</p></div>{% endif %}</section>
+{% endfor %}</div>
+{% endmacro %}
