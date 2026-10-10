@@ -11,9 +11,18 @@ const PASSWORD_HASH_ITERATIONS = 100000;
 const encoder = new TextEncoder();
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+      const artifact = url.pathname.match(/^\/api\/artifacts\/(.+)$/);
+      if (artifact && (request.method === "GET" || request.method === "HEAD")) {
+        const key = decodeURIComponent(artifact[1]);
+        const signed = key.startsWith("builds/") && await validArtifactSignature(env, key, url.searchParams);
+        // A valid artifact token already authorizes this exact object. Avoid a
+        // D1 session lookup even when the Launcher also sends its login cookie.
+        const user = signed ? null : await currentUser(request, env);
+        return await downloadArtifact(request, env, user, key, signed, ctx);
+      }
       // Schema is managed by D1 migrations. Bootstrap only when someone signs in.
       if (request.method === "GET" && url.pathname === "/api/auth/google/start") {
         await bootstrapAdmin(env);
@@ -80,7 +89,7 @@ async function dispatch(request, env, url, user) {
   if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2]);
 
   const artifact = path.match(/^\/api\/artifacts\/(.+)$/);
-  if (artifact && method === "GET") return downloadArtifact(request, env, user, decodeURIComponent(artifact[1]));
+  if (artifact && (method === "GET" || method === "HEAD")) return downloadArtifact(request, env, user, decodeURIComponent(artifact[1]));
 
   const manifest = path.match(/^\/builds\/([^/]+)\/manifest$/) || path.match(/^\/api\/builds\/([^/]+)\/manifest$/);
   if (manifest && method === "GET") return buildManifest(request, env, manifest[1], user);
@@ -967,29 +976,108 @@ function compareVersions(left, right) {
   return 0;
 }
 
-async function downloadArtifact(request, env, user, key) {
+async function downloadArtifact(request, env, user, key, signatureValid, ctx) {
   if (!key.startsWith("builds/")) return json({ error: "invalid object path" }, 400);
   const url = new URL(request.url);
-  const signed = await validArtifactSignature(env, key, url.searchParams);
+  const signed = signatureValid ?? await validArtifactSignature(env, key, url.searchParams);
   if (!user && !signed) return json({ error: "unauthorized" }, 401);
 
-  const object = await env.BUILDS_BUCKET.get(key);
+  const startedAt = Date.now();
+  let range = null;
+  let object;
+  const rangeHeader = request.method === "GET" ? request.headers.get("Range") : null;
+  if (request.method === "HEAD" || rangeHeader) {
+    object = await env.BUILDS_BUCKET.head(key);
+    if (!object) return json({ error: "artifact not found" }, 404);
+    if (rangeHeader && artifactIfRangeMatches(request.headers.get("If-Range"), object)) {
+      range = artifactByteRange(rangeHeader, object.size);
+      if (range === false) {
+        return new Response(null, { status: 416, headers: {
+          "Content-Range": `bytes */${object.size}`,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "private, no-store",
+        } });
+      }
+    }
+  }
+  if (request.method !== "HEAD") {
+    const metadata = object;
+    object = await env.BUILDS_BUCKET.get(key, range ? {
+      range,
+      // Pin the range to the version inspected by head(). If the object changes,
+      // send the complete new version, never bytes from two different versions.
+      onlyIf: { etagMatches: metadata.etag },
+    } : undefined);
+    if (object && !object.body) {
+      range = null;
+      object = await env.BUILDS_BUCKET.get(key);
+    }
+  }
   if (!object) return json({ error: "artifact not found" }, 404);
 
+  const r2DurationMs = Date.now() - startedAt;
+  const length = range ? range.length : object.size;
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("ETag", object.httpEtag);
-  headers.set("Cache-Control", "private, max-age=300");
+  headers.set("Last-Modified", object.uploaded.toUTCString());
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Content-Length", String(length));
+  headers.set("Cache-Control", "private, max-age=300, no-transform");
+  headers.set("Server-Timing", `r2;dur=${r2DurationMs}`);
+  // A diagnostic fallback for runtimes which remove Content-Length on HEAD.
+  headers.set("X-Artifact-Size", String(object.size));
+  if (range) headers.set("Content-Range", `bytes ${range.offset}-${range.offset + range.length - 1}/${object.size}`);
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/octet-stream");
-  return new Response(object.body, { headers });
+  const status = range ? 206 : 200;
+  console.log(JSON.stringify({ event: "artifact_download", key, method: request.method,
+    status, bytes: length, offset: range?.offset ?? 0, r2DurationMs,
+    colo: request.cf?.colo ?? null, ray: request.headers.get("cf-ray"), auth: signed ? "signature" : "session" }));
+  if (request.method === "HEAD") return new Response(null, { headers });
+
+  let body = object.body;
+  if (ctx && typeof FixedLengthStream !== "undefined") {
+    // Workers ignores a manually set Content-Length for ordinary streams.
+    // FixedLengthStream preserves streaming/backpressure and enforces byte count.
+    const stream = new FixedLengthStream(length);
+    ctx.waitUntil(body.pipeTo(stream.writable).catch(() => {
+      console.warn(JSON.stringify({ event: "artifact_stream_interrupted", key, bytes: length }));
+    }));
+    body = stream.readable;
+  }
+  return new Response(body, { status, headers, encodeBody: "manual" });
+}
+
+function artifactIfRangeMatches(value, object) {
+  if (!value) return true;
+  // R2 supplies a strong ETag. Weak tags and dates are ignored conservatively:
+  // an upload timestamp alone cannot prove no second write occurred that second.
+  return value === object.httpEtag && !value.startsWith("W/");
+}
+
+function artifactByteRange(value, size) {
+  // Ignore malformed/multiple ranges, returning 200 as HTTP permits. Support
+  // closed, open-ended and suffix ranges without allocating the complete file.
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(value.trim());
+  if (!match || (!match[1] && !match[2])) return null;
+  const first = match[1] ? Number(match[1]) : null;
+  const last = match[2] ? Number(match[2]) : null;
+  if ((first !== null && !Number.isSafeInteger(first)) || (last !== null && !Number.isSafeInteger(last))) return null;
+  if (!size || (first !== null && first >= size) || (first === null && last === 0)) return false;
+  if (first !== null && last !== null && last < first) return null;
+  const offset = first ?? Math.max(0, size - last);
+  const end = first === null || last === null ? size - 1 : Math.min(last, size - 1);
+  return { offset, length: end - offset + 1 };
 }
 
 async function validArtifactSignature(env, key, params) {
   const expires = Number(params.get("expires") || 0);
   const signature = params.get("signature") || "";
-  if (!expires || !signature || expires < Math.floor(Date.now() / 1000)) return false;
-  const expected = await hmacHex(encoder.encode(env.R2_SECRET_ACCESS_KEY), `${key}.${expires}`);
-  return signature === expected;
+  if (!Number.isSafeInteger(expires) || expires < Math.floor(Date.now() / 1000)
+      || !/^[a-f0-9]{64}$/.test(signature) || !env.R2_SECRET_ACCESS_KEY) return false;
+  const signingKey = await crypto.subtle.importKey("raw", encoder.encode(env.R2_SECRET_ACCESS_KEY),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  return crypto.subtle.verify("HMAC", signingKey, hexToBytes(signature), encoder.encode(`${key}.${expires}`));
 }
 
 async function nextVersion(env, projectId, icon) {
