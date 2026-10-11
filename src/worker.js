@@ -21,6 +21,7 @@ export default {
         // A valid artifact token already authorizes this exact object. Avoid a
         // D1 session lookup even when the Launcher also sends its login cookie.
         const user = signed ? null : await currentUser(request, env);
+        if (user?.auth_type === "project-token") return json({ error: "Project tokens only permit build uploads." }, 403);
         return await downloadArtifact(request, env, user, key, signed, ctx);
       }
       // Schema is managed by D1 migrations. Bootstrap only when someone signs in.
@@ -39,6 +40,26 @@ export default {
 async function dispatch(request, env, url, user) {
   const path = url.pathname;
   const method = request.method;
+
+  // Project tokens are upload credentials, not Dashboard administrator sessions.
+  if (user?.auth_type === "project-token") {
+    const upload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/(?:init|[^/]+\/complete)$/);
+    const permitted = method === "GET" && ["/api/me", "/api/projects"].includes(path)
+      || method === "POST" && upload && upload[1] === user.project_id;
+    if (!permitted) return json({ error: "Token only permits uploads to its assigned project." }, 403);
+  }
+
+  const tokenRoute = path.match(/^\/api\/projects\/([^/]+)\/tokens(?:\/([^/]+))?$/);
+  if (tokenRoute) {
+    const denied = requireTokenAdmin(request, user);
+    if (denied) return denied;
+    const projectId = tokenRoute[1];
+    if (!await getProject(env, projectId, user)) return json({ error: "project not found" }, 404);
+    if (method === "GET" && !tokenRoute[2]) return tokenJson(await listProjectTokens(env, projectId));
+    if (method === "POST" && !tokenRoute[2]) return createProjectToken(request, env, user, projectId);
+    if (method === "DELETE" && tokenRoute[2]) return revokeProjectToken(env, projectId, tokenRoute[2]);
+    return json({ error: "method not allowed" }, 405);
+  }
 
   if (path === "/login" && method === "GET") return loginPage(url.searchParams.get("error") || "");
   if (path === "/api/auth/google/start" && method === "GET") return startGoogle(request, env);
@@ -101,6 +122,8 @@ async function dispatch(request, env, url, user) {
   if (buildDelete && method === "POST") return requireRole(user, "admin", "dev") || deleteBuild(env, buildDelete[1]);
   const apiBuildDelete = path.match(/^\/api\/builds\/([^/]+)$/);
   if (apiBuildDelete && method === "DELETE") return requireRole(user, "admin", "dev", true) || deleteBuildJson(env, apiBuildDelete[1]);
+  const buildDetails = path.match(/^\/api\/builds\/([^/]+)\/details$/);
+  if (buildDetails && method === "PATCH") return requireRole(user, "admin", "dev", true) || updateBuildDetails(request, env, user, buildDetails[1]);
 
   return null;
 }
@@ -117,15 +140,15 @@ async function bootstrapAdmin(env) {
 }
 
 async function currentUser(request, env) {
-  const tokenUser = apiTokenUser(request, env);
-  if (tokenUser) return tokenUser;
+  // An invalid/revoked Bearer credential must never fall back to a cookie.
+  if (request.headers.has("Authorization")) return apiTokenUser(request, env);
   const token = cookie(request, "sid");
   if (!token) return null;
   const tokenHash = await sha256Hex(token);
   const session = await env.DB.prepare(
     "SELECT sessions.email, users.role FROM sessions JOIN users ON users.email = sessions.email WHERE token_hash = ? AND expires_at > ?"
   ).bind(tokenHash, nowIso()).first();
-  return session ? { email: session.email, role: session.role } : null;
+  return session ? { email: session.email, role: session.role, auth_type: "session" } : null;
 }
 
 function describeUser(user) {
@@ -135,14 +158,92 @@ function describeUser(user) {
     role: user.role,
     visible_channels: visibleChannelsForRole(user.role),
     runtime_environments: runtimeEnvironmentsForRole(user.role),
+    ...(user.auth_type === "project-token" ? { project_id: user.project_id, upload_channels: user.allowed_channels } : {}),
   };
 }
 
-function apiTokenUser(request, env) {
-  const expected = env.DASHBOARD_API_TOKEN;
-  const header = request.headers.get("Authorization") || "";
-  if (!expected || header !== `Bearer ${expected}`) return null;
-  return { email: "api-token", role: "admin" };
+async function apiTokenUser(request, env) {
+  const match = (request.headers.get("Authorization") || "").match(/^Bearer (\S+)$/i);
+  if (!match) return null;
+  const token = match[1];
+  if (env.DASHBOARD_API_TOKEN && await equalApiSecrets(token, env.DASHBOARD_API_TOKEN)) {
+    return { email: "api-token", role: "admin", auth_type: "legacy-token" };
+  }
+  if (!/^gd_[0-9a-f]{64}$/.test(token)) return null;
+  const now = nowIso();
+  const row = await env.DB.prepare(
+    "SELECT project_api_tokens.* FROM project_api_tokens JOIN projects ON projects.id = project_api_tokens.project_id WHERE token_hash = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)"
+  ).bind(await sha256Hex(token), now).first();
+  if (!row) return null;
+  const allowedChannels = JSON.parse(row.channels_json);
+  if (!Array.isArray(allowedChannels) || !allowedChannels.length || allowedChannels.some(channel => !["dev", "qa", "live"].includes(channel))) return null;
+  // Limit metadata writes for repeated CI requests; authentication is always fresh.
+  if (!row.last_used_at || Date.parse(now) - Date.parse(row.last_used_at) > 300_000) {
+    await env.DB.prepare("UPDATE project_api_tokens SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL")
+      .bind(now, row.id).run();
+  }
+  return { email: `project-token:${row.id}`, role: "dev", auth_type: "project-token", token_id: row.id, project_id: row.project_id, allowed_channels: allowedChannels };
+}
+
+async function equalApiSecrets(provided, expected) {
+  const [a, b] = await Promise.all([provided, expected].map(value => crypto.subtle.digest("SHA-256", encoder.encode(value))));
+  if (crypto.subtle.timingSafeEqual) return crypto.subtle.timingSafeEqual(a, b);
+  // Node's Web Crypto lacks the Workers extension; use native HMAC verification.
+  const key = await crypto.subtle.importKey("raw", b, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  return crypto.subtle.verify("HMAC", key, await crypto.subtle.sign("HMAC", key, a), b);
+}
+
+function requireTokenAdmin(request, user) {
+  if (!user) return json({ error: "unauthorized" }, 401);
+  if (user.role !== "admin" || user.auth_type !== "session") return json({ error: "Sign in as an administrator to manage API tokens." }, 403);
+  if (request.method !== "GET") {
+    if (request.headers.get("Origin") !== new URL(request.url).origin) return json({ error: "Invalid request origin." }, 403);
+    if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) return json({ error: "Use application/json." }, 415);
+  }
+  return null;
+}
+
+function tokenJson(data, status = 200) {
+  return json(data, status, { "Cache-Control": "private, no-store", "Pragma": "no-cache", "X-Content-Type-Options": "nosniff" });
+}
+
+async function listProjectTokens(env, projectId) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, project_id, name, token_prefix, channels_json, created_by, created_at, expires_at, last_used_at, revoked_at FROM project_api_tokens WHERE project_id = ? ORDER BY created_at DESC"
+  ).bind(projectId).all();
+  return (results || []).map(({ channels_json, ...row }) => ({ ...row, channels: JSON.parse(channels_json) }));
+}
+
+async function createProjectToken(request, env, user, projectId) {
+  let payload;
+  try { payload = await readLimitedJson(request, 4096); }
+  catch (error) { return tokenJson({ error: error instanceof RangeError ? "Token settings are too large." : "Invalid JSON." }, 400); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return tokenJson({ error: "Invalid token settings." }, 400);
+  const name = typeof payload.name === "string" ? payload.name.trim() : "";
+  if (!name || name.length > 100) return tokenJson({ error: "Enter a token name of 1–100 characters." }, 400);
+  const channels = payload.channels;
+  if (!Array.isArray(channels) || !channels.length || channels.length > 3 || channels.some(channel => !["dev", "qa", "live"].includes(channel))) {
+    return tokenJson({ error: "Select at least one upload channel: dev, qa, or live." }, 400);
+  }
+  const days = payload.expires_in_days ?? 90;
+  if (![0, 30, 90, 365].includes(days)) return tokenJson({ error: "Choose an expiry of 0, 30, 90, or 365 days." }, 400);
+  const now = nowIso();
+  const token = `gd_${bytesToHex(crypto.getRandomValues(new Uint8Array(32)))}`;
+  const id = `token-${crypto.randomUUID()}`;
+  const expiresAt = days ? new Date(Date.parse(now) + days * 86400_000).toISOString() : null;
+  const uniqueChannels = [...new Set(channels)];
+  await env.DB.prepare(
+    "INSERT INTO project_api_tokens (id, project_id, name, token_hash, token_prefix, channels_json, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, projectId, name, await sha256Hex(token), token.slice(0, 11), JSON.stringify(uniqueChannels), user.email, now, expiresAt).run();
+  return tokenJson({ id, project_id: projectId, name, token, token_prefix: token.slice(0, 11), channels: uniqueChannels, expires_at: expiresAt, created_at: now, created_by: user.email, last_used_at: null, revoked_at: null }, 201);
+}
+
+async function revokeProjectToken(env, projectId, tokenId) {
+  const row = await env.DB.prepare("SELECT id FROM project_api_tokens WHERE id = ? AND project_id = ?").bind(tokenId, projectId).first();
+  if (!row) return tokenJson({ error: "token not found" }, 404);
+  await env.DB.prepare("UPDATE project_api_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND project_id = ?")
+    .bind(nowIso(), tokenId, projectId).run();
+  return tokenJson({ id: tokenId, revoked: true });
 }
 
 function requireLogin(user, asJson = false) {
@@ -188,6 +289,7 @@ async function dashboard(request, env, user) {
   const builds = selected ? await listBuilds(env, selected.id, user, url.origin) : [];
   const users = user.role === "admin" ? await listUsers(env) : [];
   const view = url.searchParams.get("view") || "dashboard";
+  const apiTokens = selected && view === "settings" && user.role === "admin" && user.auth_type === "session" ? await listProjectTokens(env, selected.id) : [];
   let bugReports = [];
   if (selected && ["logs", "report"].includes(view) && ["admin", "dev", "QA"].includes(user.role)) {
     if (view === "report") {
@@ -196,7 +298,9 @@ async function dashboard(request, env, user) {
       if (report) bugReports = [report];
     } else bugReports = await listBugReports(env, selected.id);
   }
-  return html(renderAdmin({ user, projects, selected, builds, users, bugReports, view, reportId: url.searchParams.get("report"), buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, style }));
+  const response = html(renderAdmin({ user, projects, selected, builds, users, bugReports, apiTokens, view, reportId: url.searchParams.get("report"), buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, apiTokenPanel, style }));
+  response.headers.set("Cache-Control", "private, no-store");
+  return response;
 }
 
 async function listProjects(env, user = null) {
@@ -545,6 +649,7 @@ async function deleteProjectData(env, id) {
   const listed = await env.BUILDS_BUCKET.list({ prefix: `builds/${id}/` });
   await Promise.all((listed.objects || []).map(object => env.BUILDS_BUCKET.delete(object.key)));
   await env.DB.prepare("DELETE FROM builds WHERE project_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM project_api_tokens WHERE project_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM projects WHERE id = ?").bind(id).run();
   return builds.length;
 }
@@ -588,7 +693,7 @@ async function initUploadSession(request, env, user, projectId) {
   const payload = await request.json();
   const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
-  if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
+  if (!canAssign(user, channel)) return json({ error: "forbidden" }, 403);
   const files = payload.files || [];
   if (!files.length) return json({ error: "files are required" }, 400);
   const buildId = `build-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -628,9 +733,12 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
   payload.version = reservation.version;
   const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
-  if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
+  if (!canAssign(user, channel)) return json({ error: "forbidden" }, 403);
   const files = payload.files || [];
   if (!files.length) return json({ error: "files are required" }, 400);
+  if (user.auth_type === "project-token" && files.some((file, index) => file.object_path !== objectPathFor(projectId, buildId, file.name, index + 1))) {
+    return json({ error: "Files must belong to this project's upload session." }, 400);
+  }
   const manifestFiles = await Promise.all(files.map(async file => {
     const downloadUrl = await objectDownloadUrl(env, file.object_path, baseUrl);
     return {
@@ -701,10 +809,91 @@ async function updateBuildChannel(request, env, user, buildId) {
     : Object.fromEntries(await request.formData());
   const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
-  if (!canAssign(user.role, channel)) return json({ error: "forbidden" }, 403);
+  if (!canAssign(user, channel)) return json({ error: "forbidden" }, 403);
   await env.DB.prepare("UPDATE builds SET channel = ?, status = 'assigned', updated_at = ? WHERE id = ?").bind(channel, nowIso(), buildId).run();
   const build = await env.DB.prepare("SELECT project_id FROM builds WHERE id = ?").bind(buildId).first();
   return request.url.includes("/api/") ? json({ id: buildId, channel }) : redirect(`/?project=${build?.project_id || ""}`);
+}
+
+async function updateBuildDetails(request, env, user, buildId) {
+  if (user.auth_type === "session" && request.headers.get("Origin") !== new URL(request.url).origin) {
+    return json({ error: "Invalid request origin." }, 403);
+  }
+  if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) return json({ error: "Use application/json." }, 415);
+  const build = await env.DB.prepare("SELECT * FROM builds WHERE id = ?").bind(buildId).first();
+  if (!build || !await getProject(env, build.project_id, user)) return json({ error: "build not found" }, 404);
+  let payload;
+  try { payload = await readLimitedJson(request, 128 * 1024); }
+  catch (error) { return json({ error: error instanceof RangeError ? "Build details are too large." : "Invalid JSON." }, 400); }
+  const fields = ["tag", "changelog", "focus_areas", "test_instructions", "known_issues", "save_path_hint", "config_path_hint"];
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length || Object.keys(payload).some(key => !fields.includes(key))) {
+    return json({ error: "Only release notes, tag, and testing details can be edited here." }, 400);
+  }
+  const details = Object.fromEntries(fields.map(key => [key, build[key] || ""]));
+  for (const key of fields) {
+    if (!Object.hasOwn(payload, key)) continue;
+    const value = payload[key];
+    const list = key === "focus_areas" || key === "known_issues";
+    if (typeof value !== "string" && !(list && Array.isArray(value) && value.every(item => typeof item === "string"))) {
+      return json({ error: `${key} must be text${list ? " or a list of text items" : ""}.` }, 400);
+    }
+    const text = list ? JSON.stringify(parseMetadataList(value)) : value.trim();
+    const max = key === "tag" ? 200 : key.endsWith("_hint") ? 1024 : key === "changelog" ? 64000 : 16000;
+    if (text.length > max) return json({ error: `${key} exceeds ${max} characters.` }, 400);
+    details[key] = text;
+  }
+  // Keep structured release notes and Launcher testing metadata consistent.
+  // Older uploads may have stored Test Focus only inside the changelog.
+  for (const [key, title] of [["focus_areas", "Test Focus"], ["known_issues", "Known Issues"]]) {
+    if (Object.hasOwn(payload, key)) details.changelog = setReleaseSection(details.changelog, title, parseMetadataList(details[key]));
+    else if (Object.hasOwn(payload, "changelog") && releaseSectionRanges(details.changelog, title).length) {
+      details[key] = JSON.stringify(parseMetadataList(releaseSectionText(details.changelog, title)));
+    }
+  }
+  if (details.changelog.length > 64000) return json({ error: "Combined release notes exceed 64000 characters." }, 400);
+  const updatedAt = nowIso();
+  const updated = await env.DB.prepare(
+    "UPDATE builds SET tag = ?, changelog = ?, focus_areas = ?, test_instructions = ?, known_issues = ?, save_path_hint = ?, config_path_hint = ?, updated_at = ? WHERE id = ? RETURNING id, project_id"
+  ).bind(...fields.map(key => details[key]), updatedAt, buildId).first();
+  if (!updated) return json({ error: "build not found" }, 404);
+  return json({ ...updated, ...details, focus_areas: parseMetadataList(details.focus_areas), known_issues: parseMetadataList(details.known_issues), updated_at: updatedAt }, 200, { "Cache-Control": "private, no-store" });
+}
+
+function releaseSectionRanges(value, title) {
+  const lines = String(value || "").split(/\r?\n/);
+  const ranges = [];
+  let active = null;
+  let fence = null;
+  lines.forEach((line, index) => {
+    const marker = line.trim().match(/^(`{3,}|~{3,})/);
+    if (marker) { if (!fence) fence = marker[1][0]; else if (marker[1][0] === fence) fence = null; return; }
+    if (fence) return;
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (!heading) return;
+    const level = heading[1].length;
+    if (active && level <= active.level) { ranges.push({ start: active.start, end: index }); active = null; }
+    if (!active && heading[2].trim().toLowerCase() === title.toLowerCase()) active = { start: index, level };
+  });
+  if (active) ranges.push({ start: active.start, end: lines.length });
+  return ranges;
+}
+
+function releaseSectionText(value, title) {
+  const range = releaseSectionRanges(value, title)[0];
+  return range ? String(value).split(/\r?\n/).slice(range.start + 1, range.end).join("\n").trim() : "";
+}
+
+function setReleaseSection(value, title, items) {
+  const lines = String(value || "").split(/\r?\n/);
+  const ranges = releaseSectionRanges(value, title);
+  const block = items.length ? [`## ${title}`, ...items.map(item => `- ${item}`), ""] : [];
+  if (ranges.length) {
+    [...ranges].reverse().forEach((range, index) => lines.splice(range.start, range.end - range.start, ...(index === ranges.length - 1 ? block : [])));
+  } else if (block.length) {
+    if (title === "Test Focus") lines.unshift(...block);
+    else lines.push("", ...block);
+  }
+  return lines.join("\n").trim();
 }
 
 async function rollbackBuild(env, buildId) {
@@ -1196,6 +1385,7 @@ function roleRank(role) {
 
 function canAccessProject(user, project) {
   if (!project) return false;
+  if (user?.auth_type === "project-token") return user.project_id === project.id;
   const requiredRole = project.role || "viewer";
   const effectiveRole = user?.role || "viewer";
   return roleRank(effectiveRole) >= roleRank(requiredRole);
@@ -1211,7 +1401,9 @@ function runtimeEnvironmentsForRole(role) {
   return role === "viewer" || !role ? ["production"] : ["dev", "staging", "production"];
 }
 
-function canAssign(role, channel) {
+function canAssign(user, channel) {
+  if (user?.auth_type === "project-token") return user.allowed_channels.includes(channel);
+  const role = typeof user === "string" ? user : user?.role;
   if (role === "admin") return true;
   if (role === "dev") return channel === "dev" || channel === "qa";
   if (role === "QA") return channel === "qa";
@@ -1479,6 +1671,14 @@ function projectView(user, project, builds, latest, users) {
   return `<section class="topbar"><div><div class="label">Dashboard API / R2 Storage / D1 Metadata / Role Auth</div><h2>${escapeHtml(project.name)}</h2><p>${escapeHtml(project.bundle_id)}</p></div><div class="actions">${latest ? `<a class="button secondary" href="/builds/${latest.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>` : ""}<a class="button secondary" href="/api/projects/${project.id}/builds" data-loading-steps="Opening API response|Loading project builds">API</a></div></section><section class="grid"><div class="panel">${projectManagement(user, project, builds, latest)}</div>${["admin", "dev"].includes(user.role) ? uploadPanel(user, project) : ""}</section>${user.role === "admin" ? userAccess(users, user) : ""}${buildHistory(user, project, builds)}`;
 }
 
+function apiTokenPanel(project, tokens = []) {
+  const endpoint = `/api/projects/${encodeURIComponent(project.id)}/tokens`;
+  const now = nowIso();
+  const status = token => token.revoked_at ? "Revoked" : token.expires_at && token.expires_at <= now ? "Expired" : "Active";
+  const tokenRows = tokens.map(token => `<tr><td><strong>${escapeHtml(token.name)}</strong><div class="cell-secondary mono">${escapeHtml(token.token_prefix)}…</div></td><td>${escapeHtml(token.channels.join(", "))}</td><td>${status(token)}</td><td>${escapeHtml(token.expires_at?.slice(0, 10) || "Never")}</td><td>${escapeHtml(token.last_used_at?.replace("T", " ").slice(0, 19) || "Not used")}</td><td>${token.revoked_at ? "—" : `<button type="button" class="btn secondary small danger-text" data-token-revoke="${escapeHtml(token.id)}">Revoke</button>`}</td></tr>`).join("");
+  return `<section class="surface" id="project-api-tokens" data-token-panel data-token-endpoint="${escapeHtml(endpoint)}"><div class="surface-header"><div><h2>API tokens</h2><p>Create separate credentials for this project's build workflows.</p></div></div><div class="surface-body"><div class="api-token-context"><label>Project ID<input value="${escapeHtml(project.id)}" readonly></label><button type="button" class="btn secondary small" data-copy="${escapeHtml(project.id)}">Copy project ID</button></div><form class="form-grid section-gap" data-token-create><label>Token name<input name="name" maxlength="100" placeholder="e.g. GitHub Windows build" required></label><fieldset class="token-channels"><legend>Allowed upload channels</legend>${["dev", "qa", "live"].map(channel => `<label><input type="checkbox" name="channels" value="${channel}" ${channel === "dev" ? "checked" : ""}>${({ dev: "Development", qa: "QA", live: "Live" })[channel]}</label>`).join("")}</fieldset><label>Expires after<select name="expires_in_days"><option value="30">30 days</option><option value="90" selected>90 days</option><option value="365">365 days</option><option value="0">Never</option></select></label><div><button class="btn" type="submit">Create token</button></div></form><p class="muted section-gap">Tokens can upload only to this project and the selected channels. Save the generated value as the DASHBOARD_API_TOKEN secret in the game's GitHub repository.</p><div class="api-token-result section-gap" data-token-result hidden><strong>Copy this token now</strong><p>The full value is shown only once. Keep this page open until you have saved it.</p><label>API token<input data-token-value readonly autocomplete="off" spellcheck="false"></label><div class="actions section-gap"><button type="button" class="btn secondary small" data-token-copy>Copy token</button><button type="button" class="btn secondary small" data-token-done>I have saved it</button></div></div><p role="status" class="muted section-gap" data-token-status></p></div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Channels</th><th>Status</th><th>Expires (UTC)</th><th>Last used (UTC)</th><th>Action</th></tr></thead><tbody data-token-list>${tokenRows || '<tr><td colspan="6">No API tokens for this project yet.</td></tr>'}</tbody></table></div></section>`;
+}
+
 function projectManagement(user, project, builds, latest) {
   const id = encodeURIComponent(project.id);
   return `<section class="surface settings-project" id="project-general"><div class="surface-header"><div><h2>General</h2><p>Project identity and the minimum role needed for access.</p></div><span class="channel-tag">${escapeHtml(project.role || 'viewer')} access</span></div><div class="surface-body">${user.role === "admin" ? `<form class="form-grid" method="post" action="/projects/${id}" data-loading-steps="Saving project|Updating project|Refreshing dashboard"><div class="grid-2"><label>Project name<input name="name" value="${escapeHtml(project.name)}" required></label><label>Project icon<input name="icon" value="${escapeHtml(project.icon)}" maxlength="4"><small>Up to four characters.</small></label></div><label>Bundle ID<input name="bundle_id" value="${escapeHtml(project.bundle_id)}" required><small>The application identifier used by your project.</small></label><label>Minimum access role<select name="role">${["viewer", "QA", "dev", "admin"].map(role => `<option ${project.role === role ? "selected" : ""}>${role}</option>`).join("")}</select></label><div class="form-footer"><button class="button" type="submit">Save changes</button></div></form>` : `<dl class="metadata-list">${[['Name', project.name], ['Bundle ID', project.bundle_id], ['Minimum role', project.role]].map(([label,value])=>`<div><dt>${label}</dt><dd>${escapeHtml(value || 'Not provided')}</dd></div>`).join('')}</dl><p class="muted section-gap">An admin can change project settings.</p>`}</div></section>${user.role === 'admin' ? `<section class="surface danger-zone" id="danger-zone"><div class="surface-header"><div><h2>Danger zone</h2><p>Permanent actions affecting this project and its files.</p></div></div><div class="surface-body danger-row"><div><strong>Delete project</strong><p>Remove this project and every build package it contains.</p></div><form method="post" action="/projects/${id}/delete" data-confirm="Delete this project and all builds? This cannot be undone."><button class="button danger" type="submit">Delete project</button></form></div></section>` : ''}`;
@@ -1514,10 +1714,32 @@ function buildHistory(user, project, builds) {
   return `<section class="panel"><div class="build-head"><div><h3>Build History</h3><p>Rollback promotes a selected build back to live.</p></div><div class="code">POST /api/projects/${project.id}/uploads/init</div></div>${builds.length ? `<div class="build-list">${builds.map(build => buildCard(user, build)).join("")}</div>` : `<div class="empty">No builds yet.</div>`}</section>`;
 }
 
+function buildDetailsEditor(user, build) {
+  if (!["admin", "dev"].includes(user.role)) return "";
+  const listText = (key, title) => {
+    const items = parseMetadataList(build[key]);
+    return (items.length ? items : parseMetadataList(releaseSectionText(build.changelog, title))).join("\n");
+  };
+  return `<details class="build-details-editor" id="edit-build-details"><summary>Edit build details</summary><form class="form-grid section-gap" data-build-details data-details-url="/api/builds/${encodeURIComponent(build.id)}/details"><label>Release tag<input name="tag" maxlength="200" value="${escapeHtml(build.tag || "")}" placeholder="e.g. playtest, hotfix"></label><label>Test Focus<textarea name="focus_areas" maxlength="16000" placeholder="What should the team test? One item per line.">${escapeHtml(listText("focus_areas", "Test Focus"))}</textarea></label><label>Test instructions<textarea name="test_instructions" maxlength="16000" placeholder="Steps, expected results, and test setup…">${escapeHtml(build.test_instructions || "")}</textarea></label><label>Known Issues<textarea name="known_issues" maxlength="16000" placeholder="One issue per line.">${escapeHtml(listText("known_issues", "Known Issues"))}</textarea></label><label>Release notes<textarea name="changelog" data-plain-notes maxlength="64000" rows="8">${escapeHtml(build.changelog || "")}</textarea><small>Test Focus and Known Issues above update their sections in these notes when you save.</small></label><div class="grid-2"><label>Save path hint<input name="save_path_hint" maxlength="1024" value="${escapeHtml(build.save_path_hint || "")}"></label><label>Config path hint<input name="config_path_hint" maxlength="1024" value="${escapeHtml(build.config_path_hint || "")}"></label></div><p class="muted">You can update these details at any time, including after a playtest starts.</p><p role="status" data-details-status></p><div><button class="btn" type="submit">Save details</button></div></form></details>`;
+}
+
+function buildTestingNotes(build) {
+  let content = "";
+  for (const [key, title] of [["focus_areas", "Test Focus"], ["known_issues", "Known Issues"]]) {
+    const items = parseMetadataList(build[key]);
+    if (items.length && !releaseSectionRanges(build.changelog, title).length) content += `<h3>${title}</h3><ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+  }
+  if (build.test_instructions) content += `<h3>Test instructions</h3><p class="testing-instructions">${escapeHtml(build.test_instructions)}</p>`;
+  for (const [key, title] of [["save_path_hint", "Save path"], ["config_path_hint", "Config path"]]) {
+    if (build[key]) content += `<h3>${title}</h3><p class="mono">${escapeHtml(build[key])}</p>`;
+  }
+  return content ? `<div class="release-notes section-gap">${content}</div>` : "";
+}
+
 function buildCard(user, build) {
   const channels = CHANNELS.filter(channel => canAssign(user.role, channel));
   const id = encodeURIComponent(build.id);
-  return `<article class="build-release">${releaseNotesMarkup(build.changelog)}<section class="release-controls" id="release-actions"><div><h3>Release actions</h3><p class="muted">Assign this artifact to a channel or promote it to live.</p></div>${channels.length ? `<form class="channel-assignment" method="post" action="/builds/${id}/channel"><label>Release channel<select name="channel">${channels.map(c => `<option value="${c}" ${build.channel === c ? "selected" : ""}>${({dev:'Development',qa:'QA',live:'Live',deprecated:'Deprecated'})[c]}</option>`).join("")}</select></label><button class="button secondary" type="submit">Assign channel</button></form>` : '<p class="muted">Your role can inspect this artifact. A developer or admin can manage its channel.</p>'}<div class="release-secondary-actions"><a class="button secondary" href="/builds/${id}/manifest" target="_blank" rel="noopener">Open manifest ↗</a>${user.role === "admin" ? `<form method="post" action="/builds/${id}/rollback"><button class="button secondary" type="submit">Promote to live</button></form>` : ''}</div>${["admin", "dev"].includes(user.role) ? `<details class="build-danger"><summary>Delete this build</summary><p class="muted">Permanently remove this version and its stored files.</p><form method="post" action="/builds/${id}/delete" data-confirm="Delete build version ${escapeHtml(build.version)}? This cannot be undone."><button class="button danger" type="submit">Delete build</button></form></details>` : ''}</section></article>`;
+  return `<article class="build-release">${releaseNotesMarkup(build.changelog)}${buildTestingNotes(build)}${buildDetailsEditor(user, build)}<section class="release-controls" id="release-actions"><div><h3>Release actions</h3><p class="muted">Assign this artifact to a channel or promote it to live.</p></div>${channels.length ? `<form class="channel-assignment" method="post" action="/builds/${id}/channel"><label>Release channel<select name="channel">${channels.map(c => `<option value="${c}" ${build.channel === c ? "selected" : ""}>${({dev:'Development',qa:'QA',live:'Live',deprecated:'Deprecated'})[c]}</option>`).join("")}</select></label><button class="button secondary" type="submit">Assign channel</button></form>` : '<p class="muted">Your role can inspect this artifact. A developer or admin can manage its channel.</p>'}<div class="release-secondary-actions"><a class="button secondary" href="/builds/${id}/manifest" target="_blank" rel="noopener">Open manifest ↗</a>${user.role === "admin" ? `<form method="post" action="/builds/${id}/rollback"><button class="button secondary" type="submit">Promote to live</button></form>` : ''}</div>${["admin", "dev"].includes(user.role) ? `<details class="build-danger"><summary>Delete this build</summary><p class="muted">Permanently remove this version and its stored files.</p><form method="post" action="/builds/${id}/delete" data-confirm="Delete build version ${escapeHtml(build.version)}? This cannot be undone."><button class="button danger" type="submit">Delete build</button></form></details>` : ''}</section></article>`;
 }
 
 function releaseNotesMarkup(value) {

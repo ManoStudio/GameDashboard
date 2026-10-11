@@ -21,7 +21,7 @@ const dateLabel = value => {
 };
 
 // Server-rendered views keep all existing role checks, form routes, and upload contracts.
-export function renderAdmin({ user, projects, selected, builds, users, bugReports = [], view, buildId, reportId }, forms) {
+export function renderAdmin({ user, projects, selected, builds, users, bugReports = [], apiTokens = [], view, buildId, reportId }, forms) {
   const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
   const url = (page, id = '') => '/?view=' + page + '&project=' + encodeURIComponent(selected?.id || '') + (id ? '&build=' + encodeURIComponent(id) : '');
   const reportUrl = id => '/?view=report&project=' + encodeURIComponent(selected?.id || '') + '&report=' + encodeURIComponent(id);
@@ -46,7 +46,8 @@ export function renderAdmin({ user, projects, selected, builds, users, bugReport
   } else if (view === 'upload') {
     content = editable ? forms.uploadPanel(user, selected) : `<section class="surface">${empty('Upload access required', 'A developer or admin can publish builds for this project.')}</section>`;
   } else if (view === 'settings') {
-    content = `<div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections"><a href="#project-general">General</a>${user.role === 'admin' ? '<a href="#workspace-access">Team access</a><a class="danger-text" href="#danger-zone">Danger zone</a>' : ''}</nav><div class="settings-content">${forms.projectManagement(user, selected, builds, latest)}${user.role === 'admin' ? forms.userAccess(users, user) : ''}</div></div>`;
+    const tokenAdmin = user.role === 'admin' && user.auth_type === 'session';
+    content = `<div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections"><a href="#project-general">General</a>${tokenAdmin ? '<a href="#project-api-tokens">API tokens</a>' : ''}${user.role === 'admin' ? '<a href="#workspace-access">Team access</a><a class="danger-text" href="#danger-zone">Danger zone</a>' : ''}</nav><div class="settings-content">${forms.projectManagement(user, selected, builds, latest)}${tokenAdmin ? forms.apiTokenPanel?.(selected, apiTokens) || '' : ''}${user.role === 'admin' ? forms.userAccess(users, user) : ''}</div></div>`;
   } else if (view === 'report') {
     content = canReview ? renderBugReportDetail(bugReports.find(report => report.id === reportId), selected, esc) : `<section class="surface">${empty('Report access required', 'QA, developers, and admins can review bug reports.')}</section>`;
   } else if (view === 'logs') {

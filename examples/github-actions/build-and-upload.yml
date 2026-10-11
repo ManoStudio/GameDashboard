@@ -1,0 +1,53 @@
+# Copy to .github/workflows/build-and-upload.yml in the GAME repository.
+# Copy upload-game.mjs to tools/upload-game.mjs in the same repository.
+name: Build game and upload to GameDashboard
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Dashboard release channel
+        type: choice
+        default: dev
+        options: [dev, qa]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: game-dashboard-upload-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # Set lfs: true / submodules: recursive here if your game needs them.
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Build and package game
+        shell: pwsh
+        run: |
+          # Replace this step with your engine setup, build, and ZIP packaging.
+          # Required output: artifacts/game-windows.zip
+          # Include the game EXE, data directory, DLLs, and other runtime files.
+          throw "Configure the game build step before running this workflow."
+
+      - name: Upload build to GameDashboard
+        env:
+          GAME_DASHBOARD_URL: ${{ vars.GAME_DASHBOARD_URL }}
+          GAME_PROJECT_ID: ${{ vars.GAME_PROJECT_ID }}
+          DASHBOARD_API_TOKEN: ${{ secrets.DASHBOARD_API_TOKEN }}
+          BUILD_CHANNEL: ${{ inputs.channel || 'dev' }}
+          BUILD_CHANGELOG: ${{ github.event.head_commit.message }}
+        run: node tools/upload-game.mjs artifacts/game-windows.zip

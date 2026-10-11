@@ -66,6 +66,90 @@ function initAdmin() {
     try { await navigator.clipboard.writeText(node.dataset.copy); toast('Copied to clipboard'); }
     catch { toast('Unable to copy. Select the value and copy it manually.'); }
   }));
+  $$('[data-token-panel]').forEach(panel => {
+    const form = $('[data-token-create]', panel);
+    const status = $('[data-token-status]', panel);
+    const result = $('[data-token-result]', panel);
+    const value = $('[data-token-value]', panel);
+    const list = $('[data-token-list]', panel);
+    const create = $('button[type="submit"]', form);
+    let pendingSecret = false;
+    let busy = false;
+    const updateControls = () => {
+      create.disabled = busy || pendingSecret;
+      $$('[data-token-revoke]', panel).forEach(node => node.disabled = busy);
+    };
+    async function call(method, suffix = '', payload) {
+      const response = await fetch(panel.dataset.tokenEndpoint + suffix, {
+        method, credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+        headers: { 'Content-Type': 'application/json' },
+        ...(payload ? { body: JSON.stringify(payload) } : {}),
+      });
+      let data;
+      try { data = await response.json(); }
+      catch { throw new Error('Unable to load API tokens. Check the Dashboard connection.'); }
+      if (!response.ok) throw new Error(data.error || 'Unable to manage API tokens.');
+      return data;
+    }
+    function render(tokens) {
+      list.replaceChildren();
+      if (!tokens.length) {
+        const row = document.createElement('tr'); const cell = document.createElement('td');
+        cell.colSpan = 6; cell.textContent = 'No API tokens for this project yet.'; row.append(cell); list.append(row); return;
+      }
+      tokens.forEach(token => {
+        const row = document.createElement('tr');
+        const state = token.revoked_at ? 'Revoked' : token.expires_at && Date.parse(token.expires_at) <= Date.now() ? 'Expired' : 'Active';
+        const values = [token.name + ' (' + token.token_prefix + '…)', token.channels.join(', '), state, token.expires_at?.slice(0, 10) || 'Never', token.last_used_at?.replace('T', ' ').slice(0, 19) || 'Not used'];
+        values.forEach(text => { const cell = document.createElement('td'); cell.textContent = text; row.append(cell); });
+        const action = document.createElement('td');
+        if (!token.revoked_at) {
+          const revoke = button('Revoke', () => {}, 'btn secondary small danger-text');
+          revoke.dataset.tokenRevoke = token.id; action.append(revoke);
+        } else action.textContent = '—';
+        row.append(action); list.append(row);
+      });
+    }
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (busy || pendingSecret) return;
+      const data = new FormData(form);
+      const channels = data.getAll('channels');
+      if (!channels.length) { status.textContent = 'Select at least one upload channel.'; return; }
+      busy = true; updateControls(); status.textContent = 'Creating token…';
+      try {
+        const issued = await call('POST', '', { name: data.get('name'), channels, expires_in_days: Number(data.get('expires_in_days')) });
+        value.value = issued.token; result.hidden = false; pendingSecret = true;
+        form.reset(); value.focus(); value.select();
+        status.textContent = 'Token created. Save it in GitHub Secrets before closing this page.';
+        try { render(await call('GET')); }
+        catch { status.textContent += ' The list could not refresh; your new token is shown above.'; }
+      } catch (error) { status.textContent = error.message; }
+      finally { busy = false; updateControls(); }
+    });
+    panel.addEventListener('click', async event => {
+      const revoke = event.target.closest('[data-token-revoke]');
+      if (!revoke || busy || !confirm('Revoke this token? Workflows using it will no longer authenticate.')) return;
+      busy = true; updateControls();
+      try {
+        await call('DELETE', '/' + encodeURIComponent(revoke.dataset.tokenRevoke));
+        status.textContent = 'Token revoked.';
+        render(await call('GET'));
+      } catch (error) { status.textContent = error.message; }
+      finally { busy = false; updateControls(); }
+    });
+    $('[data-token-copy]', panel).addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(value.value); toast('Token copied. Paste it into GitHub Secrets.'); }
+      catch { value.focus(); value.select(); toast('Select the token and copy it manually.'); }
+    });
+    $('[data-token-done]', panel).addEventListener('click', () => {
+      value.value = ''; result.hidden = true; pendingSecret = false; updateControls();
+      status.textContent = 'Token saved. You can create another token or revoke an existing one.';
+    });
+    window.addEventListener('beforeunload', event => { if (pendingSecret) { event.preventDefault(); event.returnValue = ''; } });
+    // Clear the one-time secret before this document enters the back/forward cache.
+    window.addEventListener('pagehide', () => { value.value = ''; result.hidden = true; pendingSecret = false; });
+  });
   $$('[data-menu]').forEach(trigger => {
     const menu = document.getElementById(trigger.dataset.menu);
     if (!menu) return;
@@ -174,6 +258,7 @@ function initAdmin() {
   });
 
   $$('textarea[name="changelog"]').forEach(source => {
+    if (source.hasAttribute('data-plain-notes')) return;
     const wrapper = document.createElement('div'); wrapper.className = 'changelog-editor'; source.parentElement.after(wrapper);
     const sections = document.createElement('div'); sections.className = 'changelog-sections'; sections.hidden = true;
     const fields = ['Test Focus', 'Added', 'Changed', 'Fixed', 'Known Issues', 'Notes'].map(title => {
@@ -189,6 +274,32 @@ function initAdmin() {
     });
     wrapper.append(toggle, sections);
     if (!source.value.trim()) toggle.click();
+  });
+
+  $$('form[data-build-details]').forEach(form => {
+    const status = $('[data-details-status]', form);
+    const save = $('button[type="submit"]', form);
+    let dirty = false;
+    let saving = false;
+    form.addEventListener('input', () => { dirty = true; });
+    window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (saving) return;
+      const payload = Object.fromEntries(new FormData(form));
+      saving = true; save.disabled = true; status.textContent = 'Saving build details…';
+      try {
+        const response = await fetch(form.dataset.detailsUrl, {
+          method: 'PATCH', credentials: 'same-origin', redirect: 'error',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Unable to save build details.');
+        dirty = false; status.textContent = 'Details saved.';
+        location.hash = 'edit-build-details'; location.reload();
+      } catch (error) { status.textContent = error.message; }
+      finally { saving = false; save.disabled = false; }
+    });
   });
 
   let activeUpload = false;
