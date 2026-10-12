@@ -341,10 +341,12 @@ async function deliverDiscordWebhook(env, projectId, webhookUrl, message) {
     url.searchParams.set("wait", "true");
     const response = await fetch(url.toString(), {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(message), redirect: "error", signal: AbortSignal.timeout(8000),
+      // Inspect redirects explicitly; the deployed Workers runtime rejects "error".
+      body: JSON.stringify(message), redirect: "manual", signal: AbortSignal.timeout(8000),
     });
     if (!response.ok) error = `Discord HTTP ${response.status}`;
-    await response.body?.cancel();
+    // Body cleanup must not turn Discord's confirmed response into a failure.
+    try { await response.body?.cancel(); } catch {}
   } catch { error = "Discord could not be reached, timed out, or rejected the webhook URL."; }
   const now = nowIso();
   try {

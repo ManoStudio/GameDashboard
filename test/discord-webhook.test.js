@@ -126,7 +126,7 @@ test('successful completion schedules one notification after registration, inclu
   const { url, options } = requests[0];
   assert.equal(new URL(url).searchParams.get('wait'), 'true');
   assert.equal(options.method, 'POST');
-  assert.equal(options.redirect, 'error');
+  assert.equal(options.redirect, 'manual');
   const message = JSON.parse(options.body);
   assert.deepEqual(message.allowed_mentions, { parse: [] });
   assert.ok(message.embeds[0].url.includes(`build=${build.id}`));
