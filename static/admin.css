@@ -227,6 +227,9 @@ input[readonly] { color: var(--muted); background: var(--panel-raised); }
 .build-details-editor textarea { min-height: 100px; }
 .build-details-editor textarea[name="changelog"] { min-height: 180px; }
 .testing-instructions { white-space: pre-wrap; }
+.discord-enabled { display: flex; flex-direction: row; align-items: center; gap: 10px; }
+.discord-enabled input { width: 16px; min-height: 16px; accent-color: var(--cyan); }
+.discord-actions { justify-content: flex-start; }
 .nav-toggle { display: none; }
 @media(max-width:760px) {
   .nav-toggle { display: inline-flex; }

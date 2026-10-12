@@ -43,6 +43,8 @@ Use permissions that can read/write objects for the `game-dashboard-builds` buck
 
 ## 3. Configure Worker secrets
 
+For Discord upload notifications, apply `0010_project_discord_webhooks.sql` before deploying. Signed-in admins configure a separate incoming webhook per project under **Settings → Discord notifications**, choose upload channels, and send a test message. Webhook credentials are stored in a separate private D1 table and never included in project/Launcher payloads. No extra Worker or GitHub secret is needed. See [Discord notification guide](docs/DISCORD_NOTIFICATIONS.md).
+
 For game build workflows, signed-in admins can now create project-scoped credentials under **Project → Settings → API tokens**. Apply `0009_project_api_tokens.sql` before deploying this change. The token is shown once and stored only as a SHA-256 hash. Put the issued token in the game's GitHub Actions secret named `DASHBOARD_API_TOKEN`; it does **not** need to be configured as a Worker secret. Multiple tokens per project are supported, with selected upload channels, optional expiry, last-used metadata, and revocation. Only signed-in admin sessions can manage them. See [GitHub build upload guide](docs/GITHUB_ACTIONS_UPLOAD.md).
 
 The Worker `DASHBOARD_API_TOKEN` secret below remains a legacy global admin credential for existing integrations. New project tokens do not require it. Revoking a project token prevents subsequent API authentication; presigned R2 upload URLs already issued remain valid for up to their 30-minute lifetime, while upload completion requires an active token.

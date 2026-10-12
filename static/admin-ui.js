@@ -66,6 +66,77 @@ function initAdmin() {
     try { await navigator.clipboard.writeText(node.dataset.copy); toast('Copied to clipboard'); }
     catch { toast('Unable to copy. Select the value and copy it manually.'); }
   }));
+  $$('[data-discord-panel]').forEach(panel => {
+    const form = $('[data-discord-settings]', panel);
+    const input = $('input[name="webhook_url"]', form);
+    const status = $('[data-discord-status]', panel);
+    const badge = $('[data-discord-configured]', panel);
+    const test = $('[data-discord-test]', panel);
+    const remove = $('[data-discord-remove]', panel);
+    const save = $('button[type="submit"]', form);
+    let configured = !test.disabled;
+    let busy = false;
+    let dirty = false;
+    function controls() {
+      save.disabled = busy;
+      test.disabled = busy || !configured || dirty;
+      remove.disabled = busy || !configured;
+      input.disabled = busy;
+      $$('input[type="checkbox"]', form).forEach(node => node.disabled = busy);
+    }
+    function apply(settings) {
+      configured = settings.configured;
+      input.value = '';
+      input.placeholder = configured ? 'Leave blank to keep the saved webhook' : 'https://discord.com/api/webhooks/…';
+      $('input[name="enabled"]', form).checked = settings.enabled;
+      $$('input[name="channels"]', form).forEach(node => node.checked = settings.channels.includes(node.value));
+      badge.textContent = configured ? 'Webhook saved' : 'Not configured';
+      dirty = false;
+    }
+    async function call(method, suffix = '', payload) {
+      const response = await fetch(panel.dataset.discordEndpoint + suffix, {
+        method, credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+        headers: { 'Content-Type': 'application/json' },
+        ...(payload ? { body: JSON.stringify(payload) } : {}),
+      });
+      let data;
+      try { data = await response.json(); }
+      catch { throw new Error('Unable to load Discord settings. Check the Dashboard connection.'); }
+      if (!response.ok) throw new Error(data.error || 'Unable to manage Discord notifications.');
+      return data;
+    }
+    form.addEventListener('input', () => { dirty = true; controls(); });
+    form.addEventListener('change', () => { dirty = true; controls(); });
+    window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+    window.addEventListener('pagehide', () => { input.value = ''; });
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (busy) return;
+      const data = new FormData(form);
+      const payload = { webhook_url: input.value, enabled: data.has('enabled'), channels: data.getAll('channels') };
+      if (!payload.channels.length) { status.textContent = 'Select at least one upload channel.'; return; }
+      busy = true; controls(); status.textContent = 'Saving notifications…';
+      try {
+        apply(await call('PUT', '', payload));
+        status.textContent = 'Discord notification settings saved.';
+      } catch (error) { status.textContent = error.message; }
+      finally { busy = false; controls(); }
+    });
+    test.addEventListener('click', async () => {
+      if (busy || dirty) return;
+      busy = true; controls(); status.textContent = 'Sending a test message to Discord…';
+      try { await call('POST', '/test'); status.textContent = 'Test message sent to your Discord channel.'; }
+      catch (error) { status.textContent = error.message; }
+      finally { busy = false; controls(); }
+    });
+    remove.addEventListener('click', async () => {
+      if (busy || !confirm('Remove this project’s saved Discord webhook and stop notifications?')) return;
+      busy = true; controls();
+      try { apply(await call('DELETE')); status.textContent = 'Discord webhook removed.'; }
+      catch (error) { status.textContent = error.message; }
+      finally { busy = false; controls(); }
+    });
+  });
   $$('[data-token-panel]').forEach(panel => {
     const form = $('[data-token-create]', panel);
     const status = $('[data-token-status]', panel);

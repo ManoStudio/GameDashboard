@@ -29,7 +29,7 @@ export default {
         await bootstrapAdmin(env);
       }
       const user = await currentUser(request, env);
-      const route = await dispatch(request, env, url, user);
+      const route = await dispatch(request, env, url, user, ctx);
       return route || notFound();
     } catch (error) {
       return html(`<h1>Server Error</h1><pre>${escapeHtml(error.stack || error.message)}</pre>`, 500);
@@ -37,7 +37,7 @@ export default {
   },
 };
 
-async function dispatch(request, env, url, user) {
+async function dispatch(request, env, url, user, ctx) {
   const path = url.pathname;
   const method = request.method;
 
@@ -58,6 +58,23 @@ async function dispatch(request, env, url, user) {
     if (method === "GET" && !tokenRoute[2]) return tokenJson(await listProjectTokens(env, projectId));
     if (method === "POST" && !tokenRoute[2]) return createProjectToken(request, env, user, projectId);
     if (method === "DELETE" && tokenRoute[2]) return revokeProjectToken(env, projectId, tokenRoute[2]);
+    return json({ error: "method not allowed" }, 405);
+  }
+
+  const discordRoute = path.match(/^\/api\/projects\/([^/]+)\/discord-webhook(\/test)?$/);
+  if (discordRoute) {
+    const denied = requireTokenAdmin(request, user, "Discord notification settings");
+    if (denied) return denied;
+    const projectId = discordRoute[1];
+    const project = await getProject(env, projectId, user);
+    if (!project) return json({ error: "project not found" }, 404);
+    if (method === "GET" && !discordRoute[2]) return tokenJson(await discordWebhookState(env, projectId));
+    if (method === "PUT" && !discordRoute[2]) return saveDiscordWebhook(request, env, user, projectId);
+    if (method === "DELETE" && !discordRoute[2]) {
+      await env.DB.prepare("DELETE FROM project_discord_webhooks WHERE project_id = ?").bind(projectId).run();
+      return tokenJson(await discordWebhookState(env, projectId));
+    }
+    if (method === "POST" && discordRoute[2]) return testDiscordWebhook(env, project, url.origin);
     return json({ error: "method not allowed" }, 405);
   }
 
@@ -107,7 +124,7 @@ async function dispatch(request, env, url, user) {
   const initUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/init$/);
   if (initUpload && method === "POST") return requireRole(user, "admin", "dev", true) || initUploadSession(request, env, user, initUpload[1]);
   const completeUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/([^/]+)\/complete$/);
-  if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2]);
+  if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2], ctx);
 
   const artifact = path.match(/^\/api\/artifacts\/(.+)$/);
   if (artifact && (method === "GET" || method === "HEAD")) return downloadArtifact(request, env, user, decodeURIComponent(artifact[1]));
@@ -193,9 +210,9 @@ async function equalApiSecrets(provided, expected) {
   return crypto.subtle.verify("HMAC", key, await crypto.subtle.sign("HMAC", key, a), b);
 }
 
-function requireTokenAdmin(request, user) {
+function requireTokenAdmin(request, user, resource = "API tokens") {
   if (!user) return json({ error: "unauthorized" }, 401);
-  if (user.role !== "admin" || user.auth_type !== "session") return json({ error: "Sign in as an administrator to manage API tokens." }, 403);
+  if (user.role !== "admin" || user.auth_type !== "session") return json({ error: `Sign in as an administrator to manage ${resource}.` }, 403);
   if (request.method !== "GET") {
     if (request.headers.get("Origin") !== new URL(request.url).origin) return json({ error: "Invalid request origin." }, 403);
     if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) return json({ error: "Use application/json." }, 415);
@@ -246,6 +263,121 @@ async function revokeProjectToken(env, projectId, tokenId) {
   return tokenJson({ id: tokenId, revoked: true });
 }
 
+function normalizeDiscordWebhook(value) {
+  if (typeof value !== "string" || value.length > 512) throw new Error("Invalid Discord webhook URL.");
+  const url = new URL(value.trim());
+  if (url.protocol !== "https:" || !["discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"].includes(url.hostname) || url.port || url.username || url.password || url.hash) throw new Error("Invalid Discord webhook URL.");
+  if (!/^\/api(?:\/v\d{1,2})?\/webhooks\/\d{16,22}\/[A-Za-z0-9._-]{20,200}\/?$/.test(url.pathname)) throw new Error("Invalid Discord webhook URL.");
+  const params = [...url.searchParams];
+  if (params.length > 1 || params.some(([key, val]) => key !== "thread_id" || !/^\d{16,22}$/.test(val))) throw new Error("Invalid Discord webhook URL.");
+  url.hostname = "discord.com";
+  url.pathname = url.pathname.replace(/\/$/, "");
+  return url.toString();
+}
+
+async function discordWebhookState(env, projectId) {
+  const row = await env.DB.prepare("SELECT * FROM project_discord_webhooks WHERE project_id = ?").bind(projectId).first();
+  // Posting credentials are write-only from the UI, never returned to any client.
+  return {
+    configured: Boolean(row?.webhook_url), enabled: Boolean(row?.enabled),
+    channels: row ? JSON.parse(row.channels_json) : [...CHANNELS],
+    last_attempt_at: row?.last_attempt_at || null, last_sent_at: row?.last_sent_at || null,
+    last_error: row?.last_error || null,
+  };
+}
+
+async function saveDiscordWebhook(request, env, user, projectId) {
+  let payload;
+  try { payload = await readLimitedJson(request, 4096); }
+  catch { return tokenJson({ error: "Invalid or oversized webhook settings." }, 400); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || typeof payload.enabled !== "boolean" || !Array.isArray(payload.channels) || !payload.channels.length || payload.channels.length > 4 || payload.channels.some(channel => !CHANNELS.includes(channel)) || typeof payload.webhook_url !== "string") {
+    return tokenJson({ error: "Enter a webhook URL, enable/disable notifications, and select upload channels." }, 400);
+  }
+  const existing = await env.DB.prepare("SELECT webhook_url FROM project_discord_webhooks WHERE project_id = ?").bind(projectId).first();
+  let webhookUrl = existing?.webhook_url || null;
+  if (payload.webhook_url.trim()) {
+    try { webhookUrl = normalizeDiscordWebhook(payload.webhook_url); }
+    catch { return tokenJson({ error: "Use an HTTPS Discord incoming webhook URL. Only an optional thread_id query is supported." }, 400); }
+  }
+  if (payload.enabled && !webhookUrl) return tokenJson({ error: "Add a Discord webhook URL before enabling notifications." }, 400);
+  await env.DB.prepare(
+    "INSERT INTO project_discord_webhooks (project_id, webhook_url, enabled, channels_json, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET webhook_url = excluded.webhook_url, enabled = excluded.enabled, channels_json = excluded.channels_json, updated_by = excluded.updated_by, updated_at = excluded.updated_at, last_attempt_at = CASE WHEN webhook_url IS excluded.webhook_url THEN last_attempt_at ELSE NULL END, last_sent_at = CASE WHEN webhook_url IS excluded.webhook_url THEN last_sent_at ELSE NULL END, last_error = CASE WHEN webhook_url IS excluded.webhook_url THEN last_error ELSE NULL END"
+  ).bind(projectId, webhookUrl, payload.enabled ? 1 : 0, JSON.stringify([...new Set(payload.channels)]), user.email, nowIso()).run();
+  return tokenJson(await discordWebhookState(env, projectId));
+}
+
+function discordText(value, max = 1024) {
+  const text = String(value || "").replace(/[\\`*_{}\[\]()<>~|]/g, "\\$&");
+  return text.length <= max ? text : text.slice(0, max - 1).replace(/[\uD800-\uDBFF]$/, "") + "…";
+}
+
+function discordUploadMessage(project, build, baseUrl) {
+  const url = new URL("/", baseUrl);
+  url.search = new URLSearchParams({ view: "build", project: project.id, build: build.id }).toString();
+  const size = Math.max(0, Number(build.total_size) || 0);
+  const sizeText = size >= 1073741824 ? `${(size / 1073741824).toFixed(2)} GB` : `${(size / 1048576).toFixed(1)} MB`;
+  const fields = [
+    { name: "Version", value: discordText(build.version) || "—", inline: true },
+    { name: "Channel", value: discordText(build.channel) || "—", inline: true },
+    { name: "Package", value: `${Number(build.file_count) || 0} files · ${sizeText}`, inline: true },
+  ];
+  for (const [key, name] of [["tag", "Tag"], ["branch", "Branch"], ["commit_sha", "Commit"]]) {
+    if (build[key]) fields.push({ name, value: discordText(build[key], 200), inline: true });
+  }
+  return {
+    username: "GameDashboard", allowed_mentions: { parse: [] },
+    embeds: [{ title: `Build uploaded · ${String(project.name).slice(0, 220)}`, url: url.toString(),
+      color: 0xa8c66c, fields, timestamp: nowIso(),
+      ...(build.changelog ? { description: discordText(build.changelog, 1200) } : {}),
+    }],
+  };
+}
+
+async function deliverDiscordWebhook(env, projectId, webhookUrl, message) {
+  let error = null;
+  try {
+    const url = new URL(normalizeDiscordWebhook(webhookUrl));
+    // wait=true makes Discord confirm creation rather than silently accepting.
+    url.searchParams.set("wait", "true");
+    const response = await fetch(url.toString(), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message), redirect: "error", signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) error = `Discord HTTP ${response.status}`;
+    await response.body?.cancel();
+  } catch { error = "Discord could not be reached, timed out, or rejected the webhook URL."; }
+  const now = nowIso();
+  try {
+    await env.DB.prepare("UPDATE project_discord_webhooks SET last_attempt_at = ?, last_sent_at = CASE WHEN ? IS NULL THEN ? ELSE last_sent_at END, last_error = ? WHERE project_id = ? AND webhook_url = ?")
+      .bind(now, error, now, error, projectId, webhookUrl).run();
+  } catch {
+    console.warn(JSON.stringify({ event: "discord_webhook_status_failed", project_id: projectId }));
+  }
+  if (error) console.warn(JSON.stringify({ event: "discord_webhook_delivery_failed", project_id: projectId, error }));
+  return { ok: !error, error };
+}
+
+async function notifyDiscordUpload(env, project, build, baseUrl) {
+  try {
+    const row = await env.DB.prepare("SELECT webhook_url, enabled, channels_json FROM project_discord_webhooks WHERE project_id = ?").bind(project.id).first();
+    if (!row?.enabled || !row.webhook_url || !JSON.parse(row.channels_json).includes(build.channel)) return;
+    await deliverDiscordWebhook(env, project.id, row.webhook_url, discordUploadMessage(project, build, baseUrl));
+  } catch {
+    // Notifications must never make a completed upload fail or reveal credentials.
+    console.warn(JSON.stringify({ event: "discord_webhook_notification_failed", project_id: project.id, build_id: build.id }));
+  }
+}
+
+async function testDiscordWebhook(env, project, baseUrl) {
+  const row = await env.DB.prepare("SELECT webhook_url FROM project_discord_webhooks WHERE project_id = ?").bind(project.id).first();
+  if (!row?.webhook_url) return tokenJson({ error: "Save a webhook URL before sending a test message." }, 400);
+  const result = await deliverDiscordWebhook(env, project.id, row.webhook_url, {
+    username: "GameDashboard", allowed_mentions: { parse: [] },
+    content: `GameDashboard webhook test for ${discordText(project.name, 200)}.\n${new URL(`/?view=settings&project=${encodeURIComponent(project.id)}`, baseUrl)}`,
+  });
+  return tokenJson(result.ok ? { ok: true } : { error: result.error }, result.ok ? 200 : 502);
+}
+
 function requireLogin(user, asJson = false) {
   if (user) return null;
   return asJson ? json({ error: "unauthorized" }, 401) : redirect("/login");
@@ -290,6 +422,7 @@ async function dashboard(request, env, user) {
   const users = user.role === "admin" ? await listUsers(env) : [];
   const view = url.searchParams.get("view") || "dashboard";
   const apiTokens = selected && view === "settings" && user.role === "admin" && user.auth_type === "session" ? await listProjectTokens(env, selected.id) : [];
+  const discordWebhook = selected && view === "settings" && user.role === "admin" && user.auth_type === "session" ? await discordWebhookState(env, selected.id) : null;
   let bugReports = [];
   if (selected && ["logs", "report"].includes(view) && ["admin", "dev", "QA"].includes(user.role)) {
     if (view === "report") {
@@ -298,7 +431,7 @@ async function dashboard(request, env, user) {
       if (report) bugReports = [report];
     } else bugReports = await listBugReports(env, selected.id);
   }
-  const response = html(renderAdmin({ user, projects, selected, builds, users, bugReports, apiTokens, view, reportId: url.searchParams.get("report"), buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, apiTokenPanel, style }));
+  const response = html(renderAdmin({ user, projects, selected, builds, users, bugReports, apiTokens, discordWebhook, view, reportId: url.searchParams.get("report"), buildId: url.searchParams.get("build") }, { createProjectForm, projectManagement, uploadPanel, userAccess, buildCard, apiTokenPanel, discordWebhookPanel, style }));
   response.headers.set("Cache-Control", "private, no-store");
   return response;
 }
@@ -650,6 +783,7 @@ async function deleteProjectData(env, id) {
   await Promise.all((listed.objects || []).map(object => env.BUILDS_BUCKET.delete(object.key)));
   await env.DB.prepare("DELETE FROM builds WHERE project_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM project_api_tokens WHERE project_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM project_discord_webhooks WHERE project_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM projects WHERE id = ?").bind(id).run();
   return builds.length;
 }
@@ -718,7 +852,7 @@ async function initUploadSession(request, env, user, projectId) {
   return json({ build_id: buildId, version, bucket: env.R2_BUCKET_NAME, expires_in_seconds: 1800, uploads });
 }
 
-async function completeUploadSession(request, env, user, projectId, buildId) {
+async function completeUploadSession(request, env, user, projectId, buildId, ctx) {
   const baseUrl = new URL(request.url).origin;
   const project = await getProject(env, projectId, user);
   if (!project) return json({ error: "project not found" }, 404);
@@ -760,6 +894,9 @@ async function completeUploadSession(request, env, user, projectId, buildId) {
   };
   const build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl, user);
   await env.DB.prepare("DELETE FROM build_upload_versions WHERE build_id = ?").bind(buildId).run();
+  const notification = notifyDiscordUpload(env, project, build, baseUrl);
+  if (ctx?.waitUntil) ctx.waitUntil(notification);
+  else await notification;
   return json(build, 201);
 }
 
@@ -1669,6 +1806,12 @@ function createProjectForm() {
 
 function projectView(user, project, builds, latest, users) {
   return `<section class="topbar"><div><div class="label">Dashboard API / R2 Storage / D1 Metadata / Role Auth</div><h2>${escapeHtml(project.name)}</h2><p>${escapeHtml(project.bundle_id)}</p></div><div class="actions">${latest ? `<a class="button secondary" href="/builds/${latest.id}/manifest" data-loading-steps="Opening manifest|Loading build metadata">Manifest</a>` : ""}<a class="button secondary" href="/api/projects/${project.id}/builds" data-loading-steps="Opening API response|Loading project builds">API</a></div></section><section class="grid"><div class="panel">${projectManagement(user, project, builds, latest)}</div>${["admin", "dev"].includes(user.role) ? uploadPanel(user, project) : ""}</section>${user.role === "admin" ? userAccess(users, user) : ""}${buildHistory(user, project, builds)}`;
+}
+
+function discordWebhookPanel(project, state = null) {
+  const settings = state || { configured: false, enabled: false, channels: [...CHANNELS] };
+  const status = settings.last_error ? `Last delivery failed: ${settings.last_error}` : settings.last_sent_at ? `Last message sent (UTC): ${settings.last_sent_at.replace("T", " ").slice(0, 19)}` : "No messages sent yet.";
+  return `<section class="surface" id="project-discord-webhook" data-discord-panel data-discord-endpoint="/api/projects/${encodeURIComponent(project.id)}/discord-webhook"><div class="surface-header"><div><h2>Discord notifications</h2><p>Notify your Discord channel when a build upload completes.</p></div><span class="channel-tag" data-discord-configured>${settings.configured ? "Webhook saved" : "Not configured"}</span></div><div class="surface-body"><form class="form-grid" data-discord-settings><label class="discord-enabled"><input type="checkbox" name="enabled" ${settings.enabled ? "checked" : ""}>Enable build upload notifications</label><label>Discord webhook URL<input type="password" name="webhook_url" autocomplete="off" spellcheck="false" maxlength="512" placeholder="${settings.configured ? "Leave blank to keep the saved webhook" : "https://discord.com/api/webhooks/…"}"><small>Create an incoming webhook in the destination Discord channel, then paste its URL here. The saved URL is never shown again.</small></label><fieldset class="token-channels"><legend>Notify for upload channels</legend>${CHANNELS.map(channel => `<label><input type="checkbox" name="channels" value="${channel}" ${settings.channels.includes(channel) ? "checked" : ""}>${({ dev: "Development", qa: "QA", live: "Live", deprecated: "Deprecated" })[channel]}</label>`).join("")}</fieldset><div class="actions discord-actions"><button class="btn" type="submit">Save notifications</button><button class="btn secondary" type="button" data-discord-test ${settings.configured ? "" : "disabled"}>Send test message</button><button class="btn secondary danger-text" type="button" data-discord-remove ${settings.configured ? "" : "disabled"}>Remove webhook</button></div></form><p class="muted section-gap">Messages include the project, build version, upload channel, package size, and a link to the build. Failed notifications do not interrupt uploads.</p><p role="status" class="muted section-gap" data-discord-status>${escapeHtml(status)}</p></div></section>`;
 }
 
 function apiTokenPanel(project, tokens = []) {
