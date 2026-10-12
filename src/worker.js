@@ -311,24 +311,63 @@ function discordText(value, max = 1024) {
   return text.length <= max ? text : text.slice(0, max - 1).replace(/[\uD800-\uDBFF]$/, "") + "…";
 }
 
-function discordUploadMessage(project, build, baseUrl) {
-  const url = new URL("/", baseUrl);
-  url.search = new URLSearchParams({ view: "build", project: project.id, build: build.id }).toString();
-  const size = Math.max(0, Number(build.total_size) || 0);
-  const sizeText = size >= 1073741824 ? `${(size / 1073741824).toFixed(2)} GB` : `${(size / 1048576).toFixed(1)} MB`;
-  const fields = [
-    { name: "Version", value: discordText(build.version) || "—", inline: true },
-    { name: "Channel", value: discordText(build.channel) || "—", inline: true },
-    { name: "Package", value: `${Number(build.file_count) || 0} files · ${sizeText}`, inline: true },
-  ];
-  for (const [key, name] of [["tag", "Tag"], ["branch", "Branch"], ["commit_sha", "Commit"]]) {
-    if (build[key]) fields.push({ name, value: discordText(build[key], 200), inline: true });
+function discordReleaseSummary(value) {
+  const lines = String(value || "").trim().split(/\r?\n/);
+  const formatted = lines.slice(0, 10).map(line => {
+    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    if (heading) return `**${discordText(heading[1], 120)}**`;
+    const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+    if (bullet) return `• ${discordText(bullet[1], 180)}`;
+    if (/^\s*(`{3,}|~{3,})/.test(line)) return "";
+    return discordText(line, 200);
+  });
+  const visible = [];
+  let length = 0;
+  for (const line of formatted) {
+    if (length + line.length + 1 > 900) break;
+    visible.push(line); length += line.length + 1;
   }
+  const summary = visible.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return summary + (visible.length < formatted.length || lines.length > 10 ? "\n…" : "");
+}
+
+function discordCode(value, max = 150) {
+  const text = String(value || "").replace(/`/g, "ˋ").replace(/[\r\n\t]/g, " ");
+  return `\`${text.slice(0, max).replace(/[\uD800-\uDBFF]$/, "")}\``;
+}
+
+function discordUploadMessage(project, build, baseUrl, { test = false } = {}) {
+  const url = new URL("/", baseUrl);
+  url.search = new URLSearchParams({ view: build.id ? "build" : "builds", project: project.id, ...(build.id ? { build: build.id } : {}) }).toString();
+  const projectUrl = new URL("/", baseUrl);
+  projectUrl.search = new URLSearchParams({ view: "dashboard", project: project.id }).toString();
+  const size = Number.isFinite(Number(build.total_size)) ? Math.max(0, Number(build.total_size)) : 0;
+  const sizeText = size >= 1073741824 ? `${(size / 1073741824).toFixed(2)} GB`
+    : size >= 1048576 ? `${(size / 1048576).toFixed(1)} MB`
+    : size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
+  const fileCount = Math.max(0, Number(build.file_count) || 0);
+  const channel = ({ dev: "Development", qa: "QA", live: "Live", deprecated: "Deprecated" })[build.channel] || build.channel || "Not assigned";
+  const fields = [
+    { name: "Project", value: `[${discordText(project.name, 200) || "Project"}](${projectUrl.toString()})`, inline: true },
+    { name: "Channel", value: discordCode(channel, 100), inline: true },
+    { name: "Package", value: build.file_count == null ? "No build uploaded yet" : `${fileCount} ${fileCount === 1 ? "file" : "files"} · ${sizeText}`, inline: true },
+  ];
+  for (const [key, name] of [["branch", "Branch"], ["commit_sha", "Commit"], ["tag", "Tag"]]) {
+    if (build[key]) {
+      const value = key === "commit_sha" ? String(build[key]).slice(0, 7) : build[key];
+      fields.push({ name, value: discordCode(value), inline: true });
+    }
+  }
+  const summary = discordReleaseSummary(build.changelog);
+  const intro = test
+    ? `🧪 **Test message** · ${build.id ? "Preview of the latest build. No new upload was created." : "Your future build reports will use this layout."}`
+    : "A new build has been uploaded successfully.";
   return {
-    username: "GameDashboard", allowed_mentions: { parse: [] },
-    embeds: [{ title: `Build uploaded · ${String(project.name).slice(0, 220)}`, url: url.toString(),
-      color: 0xa8c66c, fields, timestamp: nowIso(),
-      ...(build.changelog ? { description: discordText(build.changelog, 1200) } : {}),
+    username: "ManoBuild Reporter", allowed_mentions: { parse: [] },
+    embeds: [{ title: `📦 Build report: ${String(build.version || "Preview").slice(0, 200)}`, url: url.toString(),
+      description: intro + (summary ? `\n\n${summary}` : ""),
+      color: 0x7c5cff, fields, timestamp: nowIso(),
+      footer: { text: `GameDashboard · ${test ? "Test message" : "Upload complete"}` },
     }],
   };
 }
@@ -371,12 +410,11 @@ async function notifyDiscordUpload(env, project, build, baseUrl) {
 }
 
 async function testDiscordWebhook(env, project, baseUrl) {
-  const row = await env.DB.prepare("SELECT webhook_url FROM project_discord_webhooks WHERE project_id = ?").bind(project.id).first();
+  const row = await env.DB.prepare("SELECT webhook_url, channels_json FROM project_discord_webhooks WHERE project_id = ?").bind(project.id).first();
   if (!row?.webhook_url) return tokenJson({ error: "Save a webhook URL before sending a test message." }, 400);
-  const result = await deliverDiscordWebhook(env, project.id, row.webhook_url, {
-    username: "GameDashboard", allowed_mentions: { parse: [] },
-    content: `GameDashboard webhook test for ${discordText(project.name, 200)}.\n${new URL(`/?view=settings&project=${encodeURIComponent(project.id)}`, baseUrl)}`,
-  });
+  const latest = await env.DB.prepare("SELECT * FROM builds WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 1").bind(project.id).first();
+  const preview = latest || { version: "Preview", channel: JSON.parse(row.channels_json)[0] || "dev" };
+  const result = await deliverDiscordWebhook(env, project.id, row.webhook_url, discordUploadMessage(project, preview, baseUrl, { test: true }));
   return tokenJson(result.ok ? { ok: true } : { error: result.error }, result.ok ? 200 : 502);
 }
 

@@ -202,3 +202,60 @@ test('only signed-in admins see the webhook form; HTML and server state contain 
   assert.ok(!html.includes(webhook));
   for (const user of [{ role: 'dev', email: 'dev@test', auth_type: 'session' }, { role: 'admin', email: 'api-token', auth_type: 'legacy-token' }]) assert.ok(!renderAdmin({ ...fixture, user }, forms).includes('data-discord-settings'));
 });
+
+test('real and test notifications share the same branded embed and latest build details', async t => {
+  const { db, call, save, upload, flush, requests } = runtime(t);
+  await save();
+  const uploaded = await upload();
+  assert.equal(uploaded.response.status, 201);
+  await flush();
+  const actual = JSON.parse(requests[0].options.body);
+  const counter = db.prepare("SELECT last_number FROM project_build_counters WHERE project_id = 'game'").get().last_number;
+  assert.equal((await call('/api/projects/game/discord-webhook/test', { method: 'POST' })).status, 200);
+  const preview = JSON.parse(requests[1].options.body);
+  assert.equal(actual.username, 'ManoBuild Reporter');
+  assert.equal(preview.username, actual.username);
+  assert.equal(actual.content, undefined);
+  assert.equal(preview.content, undefined);
+  for (const key of ['title', 'url', 'color', 'fields']) assert.deepEqual(preview.embeds[0][key], actual.embeds[0][key], key);
+  assert.equal(actual.embeds[0].color, 0x7c5cff);
+  assert.equal(actual.embeds[0].fields[0].name, 'Project');
+  assert.ok(actual.embeds[0].fields[0].value.includes('/?view=dashboard&project=game'));
+  assert.equal(actual.embeds[0].footer.text, 'GameDashboard · Upload complete');
+  assert.equal(preview.embeds[0].footer.text, 'GameDashboard · Test message');
+  assert.ok(preview.embeds[0].description.includes('**Test message**'));
+  assert.equal(db.prepare('SELECT count(*) AS n FROM builds').get().n, 1);
+  assert.equal(db.prepare("SELECT last_number FROM project_build_counters WHERE project_id = 'game'").get().last_number, counter);
+});
+
+test('test notification without a build is an honest preview with the same card layout', async t => {
+  const { call, save, requests } = runtime(t);
+  await save('game', { channels: ['qa'] });
+  assert.equal((await call('/api/projects/game/discord-webhook/test', { method: 'POST' })).status, 200);
+  const message = JSON.parse(requests[0].options.body);
+  assert.equal(message.username, 'ManoBuild Reporter');
+  assert.equal(message.embeds[0].title, '📦 Build report: Preview');
+  assert.ok(!message.embeds[0].url.includes('&build='));
+  assert.equal(message.embeds[0].fields.find(field => field.name === 'Channel').value, '`QA`');
+  assert.equal(message.embeds[0].fields.find(field => field.name === 'Package').value, 'No build uploaded yet');
+});
+
+test('card formats Markdown sections, preserves branch names, and fits Discord embed limits', async t => {
+  const { context } = runtime(t);
+  const build = { id: 'build-test', version: 'GM-Build-42', channel: 'qa', total_size: 400 * 1048576, file_count: 1,
+    branch: 'feature/new_ui`\n@everyone', commit_sha: 'f1bd95212345678', tag: 'playtest-04',
+    changelog: '## Test Focus\n- Load an old save\n\n## Fixed\n- Reconnect crashes\n' + 'Long notes '.repeat(500),
+  };
+  const message = context.discordUploadMessage({ id: 'game', name: 'Monster Delicious' }, build, origin);
+  const embed = message.embeds[0];
+  assert.ok(embed.description.includes('**Test Focus**\n• Load an old save'));
+  assert.ok(!embed.description.includes('## Test Focus'));
+  assert.equal(embed.fields.find(field => field.name === 'Commit').value, '`f1bd952`');
+  assert.equal(embed.fields.find(field => field.name === 'Branch').value, '`feature/new_uiˋ @everyone`');
+  assert.equal(embed.fields.find(field => field.name === 'Package').value, '1 file · 400.0 MB');
+  assert.ok(embed.title.length <= 256);
+  assert.ok(embed.description.length <= 1200);
+  assert.ok(embed.fields.length <= 25);
+  assert.ok(embed.fields.every(field => field.name.length <= 256 && field.value.length <= 1024));
+  assert.ok(JSON.stringify(message).length < 6000);
+});
