@@ -373,6 +373,110 @@ function initAdmin() {
     });
   });
 
+  $$('[data-upload-queue]').forEach(panel => {
+    const endpoint = panel.dataset.uploadQueue;
+    let jobs = [], saving = false, fetching = false, dragging = '', fingerprint = '';
+    const status = $('[data-queue-status]', panel);
+    const size = bytes => bytes >= 1073741824 ? (bytes / 1073741824).toFixed(2) + ' GB' : bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : (bytes / 1024).toFixed(1) + ' KB';
+    const node = (tag, text, className = '') => { const element = document.createElement(tag); element.textContent = text; element.className = className; return element; };
+    async function request(path, options = {}) {
+      const response = await fetch(path, { ...options, cache: 'no-store', signal: AbortSignal.timeout(15000) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not load the upload queue.');
+      return data;
+    }
+    function draw(data) {
+      jobs = data.jobs;
+      const active = jobs.filter(job => job.status !== 'waiting'), waiting = jobs.filter(job => job.status === 'waiting');
+      $('[data-queue-active-count]', panel).textContent = active.length;
+      $('[data-queue-waiting-count]', panel).textContent = waiting.length;
+      $('[data-queue-refresh]', panel).textContent = 'Live · refreshes every 3 seconds';
+      const nextFingerprint = JSON.stringify(jobs);
+      if (nextFingerprint === fingerprint) return;
+      fingerprint = nextFingerprint;
+      const focused = document.activeElement?.closest('[data-queue-id]')?.dataset.queueId;
+      const direction = document.activeElement?.dataset.direction;
+      for (const [selector, items, emptyTitle, emptyText] of [
+        ['[data-queue-active]', active, 'No uploads in progress', 'Incoming builds will appear here when they start uploading.'],
+        ['[data-queue-waiting]', waiting, 'The queue is clear', 'Builds arriving together will wait here in upload order.'],
+      ]) {
+        const list = $(selector, panel); list.replaceChildren();
+        if (!items.length) { const empty = node('div', '', 'queue-empty'); empty.append(node('strong', emptyTitle), node('span', emptyText)); list.append(empty); }
+        items.forEach((job, index) => {
+          const row = node('article', '', 'queue-item'); row.dataset.queueId = job.build_id; row.dataset.waiting = String(job.status === 'waiting');
+          const handle = node('span', job.position || '↑', 'queue-position'); row.append(handle);
+          const description = node('div', '', 'queue-description');
+          description.append(node('strong', job.version), node('p', job.files.join(', ') || 'Package metadata unavailable'), node('p', [job.source || 'Dashboard', job.branch].filter(Boolean).join(' · ')), node('span', job.channel.toUpperCase(), 'channel-tag'));
+          row.append(description);
+          const transfer = node('div', '', 'queue-transfer');
+          const label = job.status === 'waiting' ? 'Waiting for upload slot' : job.status === 'legacy' ? 'Uploading · legacy script' : ({ preparing: 'Preparing upload', hashing: 'Computing checksum', uploading: 'Uploading', finalizing: 'Saving build metadata' }[job.phase] || 'Uploading');
+          transfer.append(node('strong', label));
+          if (job.status !== 'waiting' && job.status !== 'legacy') {
+            const percent = job.total_bytes ? Math.min(100, Math.round(job.uploaded_bytes / job.total_bytes * 100)) : 0;
+            const bar = document.createElement('progress'); bar.max = 100; bar.value = percent; bar.setAttribute('aria-label', job.version + ' upload progress'); transfer.append(bar);
+            transfer.append(node('span', percent + '% · ' + size(job.uploaded_bytes) + ' / ' + size(job.total_bytes)));
+          } else transfer.append(node('span', job.status === 'legacy' ? 'Update the CI uploader to use queue ordering.' : size(job.total_bytes) + ' · next #' + job.position));
+          row.append(transfer);
+          const controls = node('div', '', 'queue-controls');
+          if (job.status === 'waiting') {
+            handle.title = 'Drag to reorder'; handle.style.touchAction = 'none';
+            let dragTarget = -1, pointerStart, moved = false;
+            handle.addEventListener('pointerdown', event => {
+              if (saving || fetching || event.button !== 0) return;
+              event.preventDefault(); dragging = job.build_id; pointerStart = [event.clientX, event.clientY]; moved = false; dragTarget = -1; handle.setPointerCapture(event.pointerId);
+            });
+            handle.addEventListener('pointermove', event => {
+              if (dragging !== job.build_id || !pointerStart) return;
+              if (Math.hypot(event.clientX - pointerStart[0], event.clientY - pointerStart[1]) < 6 && !moved) return;
+              moved = true; row.classList.add('dragging');
+              const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-waiting="true"]');
+              $$('.drop-target', panel).forEach(item => item.classList.remove('drop-target'));
+              dragTarget = target ? waiting.findIndex(item => item.build_id === target.dataset.queueId) : -1;
+              if (dragTarget !== -1 && target !== row) target.classList.add('drop-target');
+            });
+            const endPointerDrag = event => {
+              if (dragging !== job.build_id || !pointerStart) return;
+              const target = dragTarget; dragging = ''; pointerStart = undefined; row.classList.remove('dragging'); $$('.drop-target', panel).forEach(item => item.classList.remove('drop-target'));
+              if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+              if (event.type === 'pointerup' && moved && target >= 0 && target !== index) moveJob(job.build_id, target);
+            };
+            handle.addEventListener('pointerup', endPointerDrag); handle.addEventListener('pointercancel', endPointerDrag);
+            for (const [delta, label, glyph] of [[-1, 'Move up', '↑'], [1, 'Move down', '↓']]) {
+              const move = button(glyph, () => moveJob(job.build_id, index + delta)); move.setAttribute('aria-label', label + ' ' + job.version); move.title = label; move.dataset.direction = String(delta); move.disabled = index + delta < 0 || index + delta >= items.length; controls.append(move);
+            }
+            row.draggable = true;
+            row.addEventListener('dragstart', event => { if (saving) { event.preventDefault(); return; } dragging = job.build_id; event.dataTransfer.setData('text/plain', job.build_id); event.dataTransfer.effectAllowed = 'move'; row.classList.add('dragging'); });
+            row.addEventListener('dragover', event => { if (dragging && dragging !== job.build_id) { event.preventDefault(); row.classList.add('drop-target'); } });
+            row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+            row.addEventListener('drop', event => { event.preventDefault(); row.classList.remove('drop-target'); const id = dragging; dragging = ''; if (id && id !== job.build_id) moveJob(id, index); });
+            row.addEventListener('dragend', () => { dragging = ''; row.classList.remove('dragging'); $$('.drop-target', panel).forEach(item => item.classList.remove('drop-target')); });
+          }
+          row.append(controls); list.append(row);
+        });
+      }
+      if (focused && direction) $$('[data-queue-id]', panel).find(row => row.dataset.queueId === focused)?.querySelector('[data-direction="' + direction + '"]')?.focus();
+    }
+    async function refresh() {
+      if (saving || fetching || dragging || document.hidden) return;
+      fetching = true;
+      try { draw(await request(endpoint)); }
+      catch (error) { status.textContent = error.message; $('[data-queue-refresh]', panel).textContent = 'Connection interrupted · retrying'; }
+      finally { fetching = false; }
+    }
+    async function moveJob(id, target) {
+      if (saving || fetching) return;
+      const ids = jobs.filter(job => job.status === 'waiting').map(job => job.build_id); const from = ids.indexOf(id);
+      if (from < 0 || target < 0 || target >= ids.length) return;
+      ids.splice(from, 1); ids.splice(target, 0, id); saving = true;
+      $$('[data-direction]', panel).forEach(control => control.disabled = true);
+      try { draw(await request(endpoint + '/reorder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ build_ids: ids }) })); status.textContent = 'Upload order saved.'; }
+      catch (error) { status.textContent = error.message; fingerprint = ''; }
+      finally { saving = false; fingerprint = ''; await refresh(); }
+    }
+    $('[data-queue-reload]', panel).addEventListener('click', refresh);
+    const timer = setInterval(refresh, 3000); window.addEventListener('pagehide', () => clearInterval(timer), { once: true }); refresh();
+  });
+
   let activeUpload = false;
   window.addEventListener('beforeunload', event => { if (activeUpload) { event.preventDefault(); event.returnValue = ''; } });
   $$('form[data-direct-upload]').forEach(form => {
@@ -420,36 +524,68 @@ function initAdmin() {
       progress = document.createElement('div'); progress.className = 'upload-progress'; progress.setAttribute('role', 'status');
       const title = document.createElement('strong'); const detail = document.createElement('span'); const bar = document.createElement('progress'); bar.max = 100; bar.setAttribute('aria-label', 'Build upload progress'); progress.append(title, detail, bar); document.body.append(progress);
       const state = (label, message, percent) => { title.textContent = label; detail.textContent = message; if (percent === undefined) bar.removeAttribute('value'); else bar.value = Math.max(0, Math.min(100, percent)); };
+      const queueLink = document.createElement('a'); queueLink.textContent = 'Open upload queue ↗'; queueLink.href = form.dataset.returnUrl.replace('view=builds', 'view=queue'); queueLink.target = '_blank'; queueLink.rel = 'noopener'; progress.append(queueLink);
+      let session, heartbeat, reporting, uploadedBytes = 0, phase = 'preparing', heartbeatError, currentXhr, cancelled = false, confirmed = false;
+      const cancel = button('Cancel upload', () => { cancelled = true; currentXhr?.abort(); }); progress.append(cancel);
+      const check = () => { if (cancelled) throw new Error('Upload cancelled.'); if (heartbeatError) throw heartbeatError; };
+      const reportProgress = async () => {
+        if (reporting) return reporting;
+        reporting = (async () => {
+          const response = await fetch(form.dataset.completeBase + '/' + session.build_id + '/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploaded_bytes: uploadedBytes, phase }), signal: AbortSignal.timeout(15000) });
+          if (!response.ok) throw new Error('Could not report upload progress.');
+          const job = await response.json();
+          if (job.status !== 'uploading') throw new Error('The upload session expired. Please retry.');
+        })().finally(() => { reporting = undefined; });
+        return reporting;
+      };
       try {
         state('Preparing upload', 'Requesting an upload session…');
-        const init = await fetch(form.dataset.initUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, files: files.map(file => ({ name: file.name, size: file.size, content_type: file.type || 'application/octet-stream' })) }) });
+        const init = await fetch(form.dataset.initUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, queue: true, files: files.map(file => ({ name: file.name, size: file.size, content_type: file.type || 'application/octet-stream' })) }), signal: AbortSignal.timeout(30000) });
         if (init.status === 503 && form.dataset.demo === 'true') { activeUpload = false; controls.forEach((node, index) => node.disabled = disabled[index]); HTMLFormElement.prototype.submit.call(form); return; }
         if (!init.ok) throw new Error('Could not prepare the upload. Check your connection, access, and storage configuration.');
-        const session = await init.json(); const uploaded = []; const total = files.reduce((sum, file) => sum + file.size, 0); let sent = 0; let started = 0;
+        session = await init.json();
+        while (session.status === 'waiting') {
+          check(); state('Waiting in upload queue', session.version + ' · position #' + session.position + '. Keep this tab open.');
+          await new Promise(resolve => setTimeout(resolve, 3000)); check();
+          const response = await fetch(form.dataset.completeBase + '/' + session.build_id + '/status', { cache: 'no-store', signal: AbortSignal.timeout(15000) });
+          if (!response.ok) throw new Error('Could not check the upload queue.'); session = await response.json();
+        }
+        check();
+        if (session.status && session.status !== 'uploading') throw new Error('The upload session expired. Please retry.');
+        heartbeat = setInterval(() => reportProgress().catch(error => { heartbeatError = error; currentXhr?.abort(); }), 10000);
+        const uploaded = []; const total = files.reduce((sum, file) => sum + file.size, 0); let sent = 0; let started = 0;
         for (let index = 0; index < files.length; index++) {
           const file = files[index]; const target = session.uploads[index];
+          check(); phase = 'hashing'; await reportProgress();
           state('Validating package', 'Computing checksum for ' + file.name);
           const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
           const hash = Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+          check(); phase = 'uploading'; await reportProgress();
           started = performance.now();
           await new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest(); xhr.open('PUT', target.upload_url); xhr.setRequestHeader('Content-Type', target.content_type);
-            xhr.upload.onprogress = event => { const loaded = Math.min(event.loaded, file.size); const speed = loaded / Math.max((performance.now() - started) / 1000, .1); state('Uploading build', `${format(sent + loaded)} / ${format(total)} · ${format(speed)}/s`, total ? (sent + loaded) / total * 100 : 0); };
+            const xhr = new XMLHttpRequest(); currentXhr = xhr; xhr.open('PUT', target.upload_url); xhr.setRequestHeader('Content-Type', target.content_type);
+            xhr.upload.onprogress = event => { const loaded = Math.min(event.loaded, file.size); uploadedBytes = sent + loaded; const speed = loaded / Math.max((performance.now() - started) / 1000, .1); state('Uploading build', `${format(sent + loaded)} / ${format(total)} · ${format(speed)}/s`, total ? (sent + loaded) / total * 100 : 0); };
             xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error('The package could not be uploaded. Check storage access and retry.'));
-            xhr.onerror = () => reject(new Error('Connection interrupted. Check your connection and retry.')); xhr.send(file);
+            xhr.onabort = () => reject(heartbeatError || new Error('Upload cancelled.')); xhr.onerror = () => reject(new Error('Connection interrupted. Check your connection and retry.')); xhr.timeout = 25 * 60 * 1000; xhr.ontimeout = () => reject(new Error('Upload timed out. Please retry.')); xhr.send(file);
           });
           sent += file.size; uploaded.push({ name: file.name, size: file.size, hash, content_type: target.content_type, object_path: target.object_path });
+          uploadedBytes = sent; currentXhr = undefined;
         }
         state('Processing build', 'Saving manifest and build metadata…');
+        check(); phase = 'finalizing'; await reportProgress(); clearInterval(heartbeat); cancel.disabled = true;
         const complete = await fetch(form.dataset.completeBase + '/' + session.build_id + '/complete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, version: session.version, files: uploaded }) });
         if (!complete.ok) throw new Error('The server could not confirm this build. Check build history before retrying.');
+        confirmed = true;
         state('Build ready', 'Upload completed successfully.', 100); activeUpload = false;
         try { sessionStorage.setItem('admin-notice', 'Build uploaded successfully'); } catch {}
         location.href = form.dataset.returnUrl;
       } catch (error) {
+        clearInterval(heartbeat); if (reporting) await reporting.catch(() => {});
+        if (session?.build_id && !confirmed) await fetch(form.dataset.completeBase + '/' + session.build_id + '/fail', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(10000) }).catch(() => {});
+        cancel.remove();
         state('Upload failed', error.message, 0);
         progress.append(button('Retry upload', () => form.requestSubmit()), button('Dismiss', () => progress.remove()));
-      } finally { activeUpload = false; form.classList.remove('uploading'); controls.forEach((node, index) => node.disabled = disabled[index]); }
+      } finally { clearInterval(heartbeat); activeUpload = false; form.classList.remove('uploading'); controls.forEach((node, index) => node.disabled = disabled[index]); }
     });
   });
   try { const message = sessionStorage.getItem('admin-notice'); if (message) { sessionStorage.removeItem('admin-notice'); toast(message); } } catch {}

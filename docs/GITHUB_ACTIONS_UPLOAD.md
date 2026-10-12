@@ -106,3 +106,6 @@ Signed upload URL มีอายุ 30 นาที สคริปต์จำ
 ตัวอย่างผ่านการทดสอบด้วย transport จำลองและ API ของ Worker ในเครื่อง ระบบ project tokens ผ่านการทดสอบกับ workerd + D1/R2 ในเครื่อง ยังไม่ได้รัน GitHub Actions หรืออัปโหลดบน production
 
 อ้างอิง GitHub: [Workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax), [Variables](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables), [Checkout](https://github.com/actions/checkout), [Setup Node.js](https://github.com/actions/setup-node)
+## Upload queue
+
+สคริปต์ `examples/github-actions/upload-game.mjs` เวอร์ชันปัจจุบันจะเข้าคิวของโปรเจกต์ก่อนส่ง ZIP ให้อัปเดตไฟล์ที่คัดลอกไปใช้ในแต่ละ repository เกม เพื่อให้เห็นและจัดลำดับ CI build ที่รออยู่ในหน้า **Upload queue** สคริปต์เก่ายังอัปโหลดได้ แต่จะแสดงเป็น legacy transfer ซึ่งจัดลำดับก่อนส่งไม่ได้ อ่านรายละเอียดได้ใน [Upload queue](UPLOAD_QUEUE.md)

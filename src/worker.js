@@ -43,9 +43,9 @@ async function dispatch(request, env, url, user, ctx) {
 
   // Project tokens are upload credentials, not Dashboard administrator sessions.
   if (user?.auth_type === "project-token") {
-    const upload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/(?:init|[^/]+\/complete)$/);
+    const upload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/(?:init|[^/]+\/(?:complete|status|progress|fail))$/);
     const permitted = method === "GET" && ["/api/me", "/api/projects"].includes(path)
-      || method === "POST" && upload && upload[1] === user.project_id;
+      || upload && upload[1] === user.project_id && (method === "POST" && !path.endsWith('/status') || method === "GET" && path.endsWith('/status'));
     if (!permitted) return json({ error: "Token only permits uploads to its assigned project." }, 403);
   }
 
@@ -123,6 +123,21 @@ async function dispatch(request, env, url, user, ctx) {
 
   const initUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/init$/);
   if (initUpload && method === "POST") return requireRole(user, "admin", "dev", true) || initUploadSession(request, env, user, initUpload[1]);
+  const uploadQueue = path.match(/^\/api\/projects\/([^/]+)\/upload-queue(?:\/(reorder))?$/);
+  if (uploadQueue) {
+    const denied = requireRole(user, "admin", "dev", true);
+    if (denied) return denied;
+    if (!await getProject(env, uploadQueue[1], user)) return tokenJson({ error: "project not found" }, 404);
+    if (method === "GET" && !uploadQueue[2]) return tokenJson(await listUploadQueue(env, uploadQueue[1]));
+    if (method === "POST" && uploadQueue[2]) return reorderUploadQueue(request, env, user, uploadQueue[1]);
+    return tokenJson({ error: "method not allowed" }, 405);
+  }
+  const uploadState = path.match(/^\/api\/projects\/([^/]+)\/uploads\/([^/]+)\/(status|progress|fail)$/);
+  if (uploadState) {
+    const denied = requireRole(user, "admin", "dev", true) || uploadMutationGuard(request, user);
+    if (denied) return denied;
+    return updateUploadSession(request, env, user, uploadState[1], uploadState[2], uploadState[3]);
+  }
   const completeUpload = path.match(/^\/api\/projects\/([^/]+)\/uploads\/([^/]+)\/complete$/);
   if (completeUpload && method === "POST") return requireRole(user, "admin", "dev", true) || completeUploadSession(request, env, user, completeUpload[1], completeUpload[2], ctx);
 
@@ -824,6 +839,8 @@ async function deleteProjectData(env, id) {
   await env.DB.prepare("DELETE FROM builds WHERE project_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM project_api_tokens WHERE project_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM project_discord_webhooks WHERE project_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM upload_queue WHERE project_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM build_upload_versions WHERE project_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM projects WHERE id = ?").bind(id).run();
   return builds.length;
 }
@@ -861,6 +878,8 @@ async function deleteUser(request, env, current, email) {
 }
 
 async function initUploadSession(request, env, user, projectId) {
+  const denied = uploadMutationGuard(request, user);
+  if (denied) return denied;
   const missing = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME"].filter(key => !env[key]);
   if (missing.length) return json({ error: `missing R2 config: ${missing.join(", ")}` }, 500);
 
@@ -868,14 +887,27 @@ async function initUploadSession(request, env, user, projectId) {
   const channel = String(payload.channel || "dev").trim().toLowerCase();
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
   if (!canAssign(user, channel)) return json({ error: "forbidden" }, 403);
-  const files = payload.files || [];
-  if (!files.length) return json({ error: "files are required" }, 400);
-  const buildId = `build-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const project = await getProject(env, projectId, user);
   if (!project) return json({ error: "project not found" }, 404);
+  const files = Array.isArray(payload.files) ? payload.files.map(file => ({ ...file, size: payload.queue === true ? file?.size : Number(file?.size || 0) })) : payload.files;
+  if (!Array.isArray(files) || !files.length || files.length > 100 || files.some(file => !file || typeof file.name !== "string" || !file.name || file.name.length > 512 || !Number.isSafeInteger(file.size) || file.size < 0)) return json({ error: "Provide 1–100 files with names and valid sizes." }, 400);
+  if (!Number.isSafeInteger(files.reduce((sum, file) => sum + file.size, 0))) return json({ error: "Invalid total file size." }, 400);
+  if (payload.queue === true && Number((await env.DB.prepare("SELECT COUNT(*) AS count FROM upload_queue WHERE project_id = ? AND status = 'waiting'").bind(projectId).first()).count) >= 200) return tokenJson({ error: "This project's upload queue is full. Try again later." }, 429);
+  const buildId = `build-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const version = await nextVersion(env, projectId, project.icon);
   await env.DB.prepare("INSERT INTO build_upload_versions (build_id, project_id, version, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?)")
     .bind(buildId, projectId, version, user.email, nowIso()).run();
+  const queued = payload.queue === true;
+  const now = nowIso();
+  const descriptors = files.map(file => ({ name: file.name, size: file.size, content_type: String(file.content_type || "application/octet-stream").slice(0, 200) }));
+  await env.DB.prepare(`INSERT INTO upload_queue (build_id,project_id,version,owner,channel,source,branch,files_json,total_bytes,managed,status,phase,sort_order,created_at,updated_at,lease_expires_at)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(MAX(sort_order),0)+1024,?,?,? FROM upload_queue WHERE project_id = ?`)
+    .bind(buildId, projectId, version, user.email, channel, String(payload.build_source || "Dashboard").slice(0,100), String(payload.branch || "").slice(0,200), JSON.stringify(descriptors), descriptors.reduce((sum, file) => sum + file.size, 0), queued ? 1 : 0, queued ? "waiting" : "legacy", queued ? "waiting" : "uploading", now, now, uploadLease(queued ? 300 : 1800), projectId).run();
+  if (queued) {
+    await advanceUploadQueue(env, projectId);
+    const job = await env.DB.prepare("SELECT * FROM upload_queue WHERE build_id = ?").bind(buildId).first();
+    return tokenJson(await uploadSessionResponse(env, job), job.status === "waiting" ? 202 : 200);
+  }
   const uploads = [];
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
@@ -893,6 +925,8 @@ async function initUploadSession(request, env, user, projectId) {
 }
 
 async function completeUploadSession(request, env, user, projectId, buildId, ctx) {
+  const denied = uploadMutationGuard(request, user);
+  if (denied) return denied;
   const baseUrl = new URL(request.url).origin;
   const project = await getProject(env, projectId, user);
   if (!project) return json({ error: "project not found" }, 404);
@@ -909,9 +943,19 @@ async function completeUploadSession(request, env, user, projectId, buildId, ctx
   if (!CHANNELS.includes(channel)) return json({ error: "invalid channel" }, 400);
   if (!canAssign(user, channel)) return json({ error: "forbidden" }, 403);
   const files = payload.files || [];
-  if (!files.length) return json({ error: "files are required" }, 400);
+  if (!Array.isArray(files) || !files.length) return json({ error: "files are required" }, 400);
   if (user.auth_type === "project-token" && files.some((file, index) => file.object_path !== objectPathFor(projectId, buildId, file.name, index + 1))) {
     return json({ error: "Files must belong to this project's upload session." }, 400);
+  }
+  const job = await env.DB.prepare("SELECT * FROM upload_queue WHERE build_id = ? AND project_id = ?").bind(buildId, projectId).first();
+  if (job?.managed) {
+    const expected = JSON.parse(job.files_json);
+    if (job.channel !== channel || files.length !== expected.length || files.some((file, index) => file.name !== expected[index].name || file.size !== expected[index].size || file.object_path !== objectPathFor(projectId, buildId, file.name, index + 1))) {
+      return tokenJson({ error: "Files and channel must match the queued upload." }, 400);
+    }
+    const claimed = await env.DB.prepare("UPDATE upload_queue SET status = 'finalizing', phase = 'finalizing', updated_at = ?, lease_expires_at = ? WHERE build_id = ? AND status = 'uploading' AND lease_expires_at > ? RETURNING build_id")
+      .bind(nowIso(), uploadLease(), buildId, nowIso()).first();
+    if (!claimed) return tokenJson({ error: "This upload is not active. Initialize a new upload if its lease expired." }, 409);
   }
   const manifestFiles = await Promise.all(files.map(async file => {
     const downloadUrl = await objectDownloadUrl(env, file.object_path, baseUrl);
@@ -932,12 +976,108 @@ async function completeUploadSession(request, env, user, projectId, buildId, ctx
     total_size: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
     files: manifestFiles,
   };
-  const build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl, user);
+  let build;
+  try { build = await saveBuild(env, projectId, buildId, payload, manifest, baseUrl, user); }
+  catch (error) {
+    await env.DB.prepare("UPDATE upload_queue SET status = 'failed', phase = 'failed', updated_at = ? WHERE build_id = ? AND status = 'finalizing'").bind(nowIso(), buildId).run();
+    await advanceUploadQueue(env, projectId);
+    throw error;
+  }
+  await env.DB.prepare("UPDATE upload_queue SET status = 'completed', phase = 'completed', uploaded_bytes = total_bytes, updated_at = ? WHERE build_id = ?").bind(nowIso(), buildId).run();
   await env.DB.prepare("DELETE FROM build_upload_versions WHERE build_id = ?").bind(buildId).run();
+  await advanceUploadQueue(env, projectId);
   const notification = notifyDiscordUpload(env, project, build, baseUrl);
   if (ctx?.waitUntil) ctx.waitUntil(notification);
   else await notification;
   return json(build, 201);
+}
+
+function uploadMutationGuard(request, user) {
+  if (request.method === "GET") return null;
+  if (user?.auth_type === "session" && request.headers.get("Origin") !== new URL(request.url).origin) return tokenJson({ error: "Invalid request origin." }, 403);
+  if (user?.auth_type === "session" && !(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) return tokenJson({ error: "Use application/json." }, 415);
+  return null;
+}
+
+function uploadLease(seconds = 300) { return new Date(Date.now() + seconds * 1000).toISOString(); }
+
+// A single conditional SQL write claims the first waiting build. The partial
+// unique index also prevents two active uploads for the same project.
+async function advanceUploadQueue(env, projectId) {
+  const now = nowIso();
+  await env.DB.prepare("UPDATE upload_queue SET status = 'expired', phase = 'expired', updated_at = ? WHERE project_id = ? AND status IN ('waiting','uploading','finalizing','legacy') AND lease_expires_at <= ?")
+    .bind(now, projectId, now).run();
+  await env.DB.prepare(`UPDATE upload_queue SET status = 'uploading', phase = 'preparing', started_at = ?, updated_at = ?, lease_expires_at = ?
+    WHERE build_id = (SELECT build_id FROM upload_queue WHERE project_id = ? AND status = 'waiting' ORDER BY sort_order, created_at, build_id LIMIT 1)
+    AND status = 'waiting' AND NOT EXISTS (SELECT 1 FROM upload_queue WHERE project_id = ? AND status IN ('uploading','finalizing','legacy'))`)
+    .bind(now, now, uploadLease(), projectId, projectId).run();
+}
+
+async function uploadSessionResponse(env, job, includeUrls = true) {
+  const position = job.status === "waiting" ? Number((await env.DB.prepare(`SELECT COUNT(*) AS count FROM upload_queue WHERE project_id = ? AND status = 'waiting'
+    AND (sort_order < ? OR (sort_order = ? AND (created_at < ? OR (created_at = ? AND build_id <= ?))))`)
+    .bind(job.project_id, job.sort_order, job.sort_order, job.created_at, job.created_at, job.build_id).first()).count) : 0;
+  const result = { build_id: job.build_id, version: job.version, status: job.status, phase: job.phase, position, uploaded_bytes: job.uploaded_bytes, total_bytes: job.total_bytes, lease_expires_at: job.lease_expires_at, poll_after_seconds: 3 };
+  if (job.status === "uploading" && includeUrls) {
+    result.bucket = env.R2_BUCKET_NAME;
+    result.expires_in_seconds = 1800;
+    result.uploads = await Promise.all(JSON.parse(job.files_json).map(async (file, index) => {
+      const object_path = objectPathFor(job.project_id, job.build_id, file.name, index + 1);
+      return { ...file, object_path, upload_url: await presignPut(env, object_path, file.content_type) };
+    }));
+  }
+  return result;
+}
+
+async function updateUploadSession(request, env, user, projectId, buildId, action) {
+  if (request.method !== (action === "status" ? "GET" : "POST")) return tokenJson({ error: "method not allowed" }, 405);
+  if (!await getProject(env, projectId, user)) return tokenJson({ error: "project not found" }, 404);
+  let job = await env.DB.prepare("SELECT * FROM upload_queue WHERE build_id = ? AND project_id = ? AND owner = ?").bind(buildId, projectId, user.email).first();
+  if (!job) return tokenJson({ error: "Upload session not found." }, 404);
+  const now = nowIso();
+  if (action === "fail") {
+    await env.DB.prepare("UPDATE upload_queue SET status = 'failed', phase = 'failed', updated_at = ? WHERE build_id = ? AND status IN ('waiting','uploading','legacy')").bind(now, buildId).run();
+  } else if (action === "status") {
+    await env.DB.prepare("UPDATE upload_queue SET lease_expires_at = ? WHERE build_id = ? AND status IN ('waiting','uploading') AND lease_expires_at > ?").bind(uploadLease(), buildId, now).run();
+  } else {
+    let payload;
+    try { payload = await readLimitedJson(request, 4096); } catch { return tokenJson({ error: "Invalid progress." }, 400); }
+    const bytes = payload?.uploaded_bytes;
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > job.total_bytes || !['preparing','hashing','uploading','finalizing'].includes(payload.phase)) return tokenJson({ error: "Invalid progress." }, 400);
+    await env.DB.prepare("UPDATE upload_queue SET uploaded_bytes = MAX(uploaded_bytes, ?), phase = ?, updated_at = ?, lease_expires_at = ? WHERE build_id = ? AND status = 'uploading' AND lease_expires_at > ?")
+      .bind(bytes, payload.phase, now, uploadLease(), buildId, now).run();
+  }
+  await advanceUploadQueue(env, projectId);
+  job = await env.DB.prepare("SELECT * FROM upload_queue WHERE build_id = ?").bind(buildId).first();
+  return tokenJson(await uploadSessionResponse(env, job, action === "status"));
+}
+
+async function listUploadQueue(env, projectId) {
+  await advanceUploadQueue(env, projectId);
+  const { results } = await env.DB.prepare(`SELECT build_id, version, channel, source, branch, files_json, total_bytes, uploaded_bytes, status, phase, created_at, updated_at, started_at
+    FROM upload_queue WHERE project_id = ? AND status IN ('waiting','uploading','finalizing','legacy') ORDER BY CASE WHEN status = 'waiting' THEN 1 ELSE 0 END, sort_order, created_at, build_id`).bind(projectId).all();
+  let position = 0;
+  return { jobs: (results || []).map(({ files_json, ...job }) => ({ ...job, position: job.status === "waiting" ? ++position : 0, files: JSON.parse(files_json).map(file => file.name) })), refreshed_at: nowIso() };
+}
+
+async function reorderUploadQueue(request, env, user, projectId) {
+  if (user.auth_type !== "session") return tokenJson({ error: "Sign in to arrange the upload queue." }, 403);
+  const denied = uploadMutationGuard(request, user);
+  if (denied) return denied;
+  let payload;
+  try { payload = await readLimitedJson(request, 32_768); } catch { return tokenJson({ error: "Invalid queue order." }, 400); }
+  const ids = payload?.build_ids;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 200 || ids.some(id => typeof id !== 'string') || new Set(ids).size !== ids.length) return tokenJson({ error: "Provide the waiting build IDs in order (up to 200)." }, 400);
+  // Verify the snapshot and apply every position in the same statement. A job
+  // admitted or inserted concurrently makes this a conflict, never a lost order.
+  const order = JSON.stringify(ids);
+  const changed = await env.DB.prepare(`UPDATE upload_queue SET sort_order = (SELECT (CAST(key AS INTEGER)+1)*1024 FROM json_each(?) WHERE value = build_id), updated_at = ?
+    WHERE project_id = ? AND status = 'waiting'
+    AND (SELECT COUNT(*) FROM upload_queue WHERE project_id = ? AND status = 'waiting') = ?
+    AND NOT EXISTS (SELECT 1 FROM json_each(?) desired WHERE NOT EXISTS (SELECT 1 FROM upload_queue actual WHERE actual.build_id = desired.value AND actual.project_id = ? AND actual.status = 'waiting')) RETURNING build_id`)
+    .bind(order, nowIso(), projectId, projectId, ids.length, order, projectId).all();
+  if (changed.results.length !== ids.length) return tokenJson({ error: "The queue changed. Refresh and try again." }, 409);
+  return tokenJson(await listUploadQueue(env, projectId));
 }
 
 async function saveBuild(env, projectId, buildId, payload, manifest, baseUrl = "", user = null) {

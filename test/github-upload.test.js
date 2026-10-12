@@ -79,3 +79,45 @@ test('incomplete session fails before R2 upload', async t => {
   await assert.rejects(uploadGame(await fixture(t), async () => { calls++; return json({ build_id: 'broken', uploads: [] }); }), /incomplete session/);
   assert.equal(calls, 1);
 });
+
+test('CI waits for admission before PUT, reports bytes, and completes after the queued transfer', async t => {
+  const config = { ...await fixture(t), pollIntervalMs: 1 };
+  const calls = []; let polls = 0, puts = 0;
+  config.onQueue = job => { assert.equal(job.position,2); };
+  const result = await uploadGame(config, async (url, options) => {
+    const path = new URL(url).pathname; calls.push(path);
+    if (path.endsWith('/init')) { assert.equal(JSON.parse(options.body).queue,true); return json({build_id:session.build_id,version:session.version,status:'waiting',position:2},202); }
+    if (path.endsWith('/status')) {
+      assert.equal(options.method,undefined); assert.equal(options.headers.Authorization,'Bearer test-dashboard-secret'); assert.equal(puts,0);
+      polls++; return json(polls===1 ? {build_id:session.build_id,version:session.version,status:'waiting',position:2} : {...session,status:'uploading'});
+    }
+    if (path.endsWith('/progress')) {
+      const payload=JSON.parse(options.body); assert.equal(payload.uploaded_bytes,payload.phase==='finalizing'?bytes.length:0); return json({status:'uploading'});
+    }
+    if (path==='/upload') { puts++; const chunks=[]; for await (const chunk of options.body) chunks.push(chunk); assert.deepEqual(Buffer.concat(chunks),bytes); return new Response(null,{status:200}); }
+    assert.ok(path.endsWith('/complete')); assert.equal(puts,1); return json({id:session.build_id},201);
+  });
+  assert.equal(result.id,session.build_id); assert.equal(polls,2); assert.equal(calls.filter(path=>path.endsWith('/progress')).length,2);
+});
+
+test('CI releases its queue slot on failed PUT and never finalizes expired waiting jobs', async t => {
+  const config = { ...await fixture(t), pollIntervalMs:1 }; let failed=false, completed=false;
+  await assert.rejects(uploadGame(config,async(url,options)=>{
+    const path=new URL(url).pathname;
+    if (path.endsWith('/init')) return json({...session,status:'uploading'});
+    if (path.endsWith('/progress')) return json({status:'uploading'});
+    if (path==='/upload') { for await (const chunk of options.body) assert.ok(chunk.length); return new Response(null,{status:403}); }
+    if (path.endsWith('/fail')) { failed=true; return json({status:'failed'}); }
+    completed=true; throw new Error('unexpected completion');
+  }),/R2 upload: HTTP 403/);
+  assert.ok(failed); assert.equal(completed,false);
+  let put=false;
+  await assert.rejects(uploadGame(config,async(url)=>{
+    const path=new URL(url).pathname;
+    if (path.endsWith('/init')) return json({build_id:session.build_id,version:session.version,status:'waiting',position:1});
+    if (path.endsWith('/status')) return json({status:'expired'});
+    if (path.endsWith('/fail')) return json({status:'expired'});
+    put=true; throw new Error('must not upload');
+  }),/session expired/);
+  assert.equal(put,false);
+});

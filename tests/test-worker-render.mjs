@@ -9,7 +9,7 @@ vm.runInContext(source,context);
 const project={id:'test-project',name:'Test <Project>',icon:'TP',bundle_id:'test.game',role:'dev'};
 const build={id:'test-build',version:'0.1.25',project_id:project.id,channel:'dev',status:'assigned',created_at:'2026-09-15',total_size:1024,changelog:'<script>alert(1)</script>',manifest:{files:[]}};
 context.fixture={user:{email:'test@example.invalid',role:'admin'},projects:[project],selected:project,builds:[build],users:[],buildId:build.id};
-for(const view of ['dashboard','projects','builds','upload','build','settings','logs']){
+for(const view of ['dashboard','projects','builds','queue','upload','build','settings','logs']){
  context.fixture.view=view;
  const html=vm.runInContext('decorateHtml(renderAdmin(fixture,{createProjectForm,projectManagement,uploadPanel,userAccess,buildCard,style}))',context);
  assert.ok(html.includes('Build Manager'));assert.ok(html.includes('initAdmin();'));assert.ok(!html.includes('<script>alert(1)</script>'));

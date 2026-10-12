@@ -51,32 +51,69 @@ export async function uploadGame(config, fetchImpl = fetch) {
     catch { throw new Error(`${label}: expected a JSON response. Check the Dashboard URL and Access configuration.`); }
   }
 
-  const session = await api(`${apiPath}/init`, { ...release, files: [file] }, 'Initialize upload');
-  const target = session.uploads?.[0];
-  if (!session.build_id || !session.version || session.uploads?.length !== 1 || !target?.object_path || !target?.content_type || !target?.upload_url) {
-    throw new Error('Initialize upload: incomplete session response.');
+  let session = await api(`${apiPath}/init`, { ...release, queue: true, files: [file] }, 'Initialize upload');
+  if (!session.build_id || !session.version) throw new Error('Initialize upload: incomplete session response.');
+  const sessionPath = `${apiPath}/${encodeURIComponent(session.build_id)}`;
+  const queued = ['waiting', 'uploading'].includes(session.status);
+  let heartbeat, reporting, transferred = 0, phase = 'uploading', confirmed = false;
+  const controller = new AbortController();
+  async function report() {
+    if (reporting) return reporting;
+    reporting = api(`${sessionPath}/progress`, { uploaded_bytes: transferred, phase }, 'Report upload progress').then(job => {
+      if (job.status !== 'uploading') throw new Error('Upload session expired. Initialize a new upload.');
+    }).finally(() => { reporting = undefined; });
+    return reporting;
   }
-  if (new URL(target.upload_url).protocol !== 'https:') throw new Error('Upload URL must use HTTPS.');
-  const stream = createReadStream(filePath);
   try {
-    await once(stream, 'open');
-    const response = await send(target.upload_url, {
-      method: 'PUT',
-      headers: { 'Content-Type': target.content_type, 'Content-Length': String(file.size) },
-      body: stream,
-      duplex: 'half',
-      // Signed URLs expire after 30 minutes; hashing happens before init.
-      signal: AbortSignal.timeout(25 * 60_000),
-    }, 'R2 upload');
-    if (response.body) await response.body.cancel();
-  } finally {
-    stream.destroy();
-  }
-  return api(`${apiPath}/${encodeURIComponent(session.build_id)}/complete`, {
-    ...release,
-    version: session.version,
-    files: [{ ...file, content_type: target.content_type, object_path: target.object_path }],
-  }, 'Complete upload');
+    const waitingSince = Date.now();
+    while (session.status === 'waiting') {
+      if (Date.now() - waitingSince > 6 * 60 * 60_000) throw new Error('Timed out waiting in the upload queue.');
+      config.onQueue?.({ version: session.version, position: session.position });
+      await new Promise(resolve => setTimeout(resolve, config.pollIntervalMs ?? 3000));
+      const response = await send(new URL(`${sessionPath}/status`, base), { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000) }, 'Check upload queue');
+      session = await response.json();
+    }
+    if (session.status && session.status !== 'uploading') throw new Error('Upload session expired. Initialize a new upload.');
+    const target = session.uploads?.[0];
+    if (session.uploads?.length !== 1 || !target?.object_path || !target?.content_type || !target?.upload_url) {
+      throw new Error('Initialize upload: incomplete session response.');
+    }
+    if (new URL(target.upload_url).protocol !== 'https:') throw new Error('Upload URL must use HTTPS.');
+    if (queued) await report();
+    const stream = createReadStream(filePath);
+    async function* measuredBody() { for await (const chunk of stream) { transferred += chunk.length; yield chunk; } }
+    try {
+      await once(stream, 'open');
+      if (queued) heartbeat = setInterval(() => report().catch(() => controller.abort()), 10000);
+      const response = await send(target.upload_url, {
+        method: 'PUT',
+        headers: { 'Content-Type': target.content_type, 'Content-Length': String(file.size) },
+        body: measuredBody(),
+        duplex: 'half',
+        // Signed URLs expire after 30 minutes; hashing happens before init.
+        signal: AbortSignal.any([AbortSignal.timeout(25 * 60_000), controller.signal]),
+      }, 'R2 upload');
+      if (response.body) await response.body.cancel();
+    } finally {
+      stream.destroy();
+    }
+    clearInterval(heartbeat);
+    if (reporting) await reporting;
+    if (controller.signal.aborted) throw new Error('Upload progress heartbeat failed.');
+    if (queued) { transferred = file.size; phase = 'finalizing'; await report(); }
+    const build = await api(`${sessionPath}/complete`, {
+      ...release,
+      version: session.version,
+      files: [{ ...file, content_type: target.content_type, object_path: target.object_path }],
+    }, 'Complete upload');
+    confirmed = true;
+    return build;
+  } catch (error) {
+    clearInterval(heartbeat);
+    if (reporting) await reporting.catch(() => {});
+    if (queued && !confirmed) await api(`${sessionPath}/fail`, {}, 'Release upload queue slot').catch(() => {});
+    throw error;
+  } finally { clearInterval(heartbeat); }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -95,6 +132,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         uploaded_by: `github-actions/${process.env.GITHUB_ACTOR || 'local'}`,
         changelog: process.env.BUILD_CHANGELOG || `CI build: ${process.env.GITHUB_REPOSITORY || 'game'} run ${process.env.GITHUB_RUN_NUMBER || 'local'}`,
       },
+      onQueue: ({ version, position }) => console.log(`Waiting to upload ${version}, queue position #${position}`),
     });
     console.log(`Uploaded build ${build.id}, version ${build.version}, channel ${build.channel}`);
   } catch (error) {

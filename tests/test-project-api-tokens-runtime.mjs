@@ -34,6 +34,8 @@ try {
   for (const sql of migration.split(';').map(value => value.trim()).filter(Boolean)) await db.prepare(sql).run();
   const discordMigration = await fs.readFile('migrations/0010_project_discord_webhooks.sql', 'utf8');
   for (const sql of discordMigration.split(';').map(value => value.trim()).filter(Boolean)) await db.prepare(sql).run();
+  const queueMigration = await fs.readFile('migrations/0011_upload_queue.sql', 'utf8');
+  for (const sql of queueMigration.split(';').map(value => value.trim()).filter(Boolean)) await db.prepare(sql).run();
   await db.prepare('CREATE TABLE discord_test_messages (url TEXT, body TEXT)').run();
   await db.prepare("INSERT INTO projects (id,name,icon,bundle_id,role,created_at,updated_at) VALUES ('game','Game','GM','game','viewer','','')").run();
   await db.prepare("INSERT INTO users (email,role,password_hash,created_at,updated_at) VALUES ('admin@test.com','admin','','','')").run();
@@ -89,10 +91,28 @@ try {
   assert.equal((await db.prepare('SELECT version FROM builds WHERE id = ?').bind(session.build_id).first()).version, 'GM-Build-1');
   assert.equal((await mf.dispatchFetch(origin + '/api/me', { headers: { Authorization: 'Bearer legacy-test-token' } })).status, 200);
   assert.equal((await mf.dispatchFetch(origin + '/api/projects/other/uploads/init', { method: 'POST', headers, body: JSON.stringify({ files }) })).status, 403);
+  const queued = await Promise.all(Array.from({ length: 5 }, async () => {
+    const response = await mf.dispatchFetch(origin + '/api/projects/game/uploads/init', { method: 'POST', headers, body: JSON.stringify({ queue: true, channel: 'dev', files }) });
+    assert.ok([200,202].includes(response.status), await response.clone().text()); return response.json();
+  }));
+  assert.equal(queued.filter(job => job.status === 'uploading').length, 1);
+  const active = queued.find(job => job.status === 'uploading');
+  const waiting = (await (await mf.dispatchFetch(origin + '/api/projects/game/upload-queue', { headers: admin })).json()).jobs.filter(job => job.status === 'waiting').map(job => job.build_id).reverse();
+  const ordered = await mf.dispatchFetch(origin + '/api/projects/game/upload-queue/reorder', { method: 'POST', headers: admin, body: JSON.stringify({ build_ids: waiting }) });
+  assert.equal(ordered.status, 200, await ordered.clone().text());
+  assert.deepEqual((await ordered.json()).jobs.filter(job => job.status === 'waiting').map(job => job.build_id), waiting);
+  const progress = await mf.dispatchFetch(`${origin}/api/projects/game/uploads/${active.build_id}/progress`, { method: 'POST', headers, body: JSON.stringify({ uploaded_bytes: 2, phase: 'uploading' }) });
+  assert.equal(progress.status,200,await progress.clone().text()); assert.equal((await progress.json()).uploaded_bytes,2);
+  await mf.dispatchFetch(`${origin}/api/projects/game/uploads/${active.build_id}/fail`, { method: 'POST', headers, body: '{}' });
+  const next = await mf.dispatchFetch(`${origin}/api/projects/game/uploads/${waiting[0]}/status`, { headers });
+  assert.equal(next.status,200,await next.clone().text()); const admitted = await next.json(); assert.equal(admitted.status,'uploading'); assert.ok(admitted.uploads[0].upload_url);
+  await bucket.put(admitted.uploads[0].object_path, 'game');
+  const finalized = await mf.dispatchFetch(`${origin}/api/projects/game/uploads/${admitted.build_id}/complete`, { method: 'POST', headers, body: JSON.stringify({ channel:'dev', files:[{...files[0],object_path:admitted.uploads[0].object_path}] }) });
+  assert.equal(finalized.status,201,await finalized.clone().text());
   const revoked = await mf.dispatchFetch(`${origin}/api/projects/game/tokens/${issued.id}`, { method: 'DELETE', headers: admin });
   assert.equal(revoked.status, 200);
   assert.equal((await mf.dispatchFetch(origin + '/api/me', { headers: { ...headers, Cookie: 'sid=admin-session' } })).status, 401);
-  console.log('PASS workerd + real D1/R2: migrations, token creation, upload, captured Discord delivery via waitUntil, build editing, scope denial, revocation.');
+  console.log('PASS workerd + real D1/R2: migrations, scoped tokens, captured Discord delivery, build editing, concurrent queue admission, ordering, progress, failure release, queued completion, revocation.');
 } finally {
   await mf.dispose();
   assert.equal(path.dirname(path.resolve(root)), parent);
